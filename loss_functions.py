@@ -57,9 +57,12 @@ def initialize_hji_air3D(state, dataset_state, min_with):
 
         dirichlet = dirichlet_mask * (V.flatten() - source_boundary_values)
 
+        # h_1 loss in deepreach paper
         loss1 = (
             jnp.abs(dirichlet).sum() * V.shape[0] / 15e2
         )  
+        # h_2 loss in deepreach paper
+        # since we're integrating from 0 to T, it should be -D_t in the paper
         loss2 = (
             jnp.abs(jnp.invert(jnp.all(dirichlet_mask)) * diff_constraint_hom).sum()
         )  # if all of dirichlet_max is True, then don't use loss2

@@ -25,7 +25,7 @@ def xy_grid(grid_points):
     return xy_grid
 
 def create_dubins_3d_dataset_sampler(
-    t_min=0, t_max=1, collision_r=0.5, num_states = 3
+    t_min=0, t_max=1, collision_r=0.5, num_states=3
 ):
     """
     Create a funcion that sample points from the range:
@@ -48,7 +48,7 @@ def create_dubins_3d_dataset_sampler(
     """
     # TODO figure how to jit this
     def generate_dubins_3d(key, dataset_state):
-        key, coords_key, time_key = jax.random.split(key, num_states)
+        key, coords_key, time_key = jax.random.split(key, 3)
         coords = jax.random.uniform(coords_key, (dataset_state.batch_size, num_states), minval=-1, maxval=1)
 
         if dataset_state.counter < dataset_state.pretrain_end:
@@ -80,7 +80,8 @@ def create_dubins_3d_dataset_sampler(
         boundary_values = (boundary_values - mean)*norm_to/var
 
         # TODO figure how to jit this
-        # dirichlet_mask == coords at time t=t_min
+        # should just be
+        # dirichlet_mask = (time == t_min).flatten()
         if dataset_state.counter < dataset_state.pretrain_end:
             dirichlet_mask = jnp.ones(dataset_state.batch_size)
         else:

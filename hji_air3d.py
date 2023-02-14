@@ -13,6 +13,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 from modules import SirenNet
 import optax
+import orbax.checkpoint as orbax
 import jax
 import jax.numpy as jnp
 from flax.training import train_state
@@ -21,19 +22,40 @@ from flax.training import checkpoints
 from dataio import DatasetState, create_dubins_3d_dataset_sampler, xy_grid
 from loss_functions import initialize_hji_air3D
 
-import torch
 import tqdm
 
 import wandb
 
+
 def main(args):
+
+    key = jax.random.PRNGKey(args.seed)
+    key, model_key = jax.random.split(key)
     layers = [args.num_nl for _ in range(args.num_hl)]
 
-    @jax.vmap
-    def periodic_transform(x):
-        return jnp.array([x[0], x[1], jnp.cos(x[2]), jnp.sin(x[2])])
+    if args.periodic_transform:
 
-    model = SirenNet(hidden_layers=layers, transform_fn=periodic_transform)
+        @jax.vmap
+        def periodic_transform(x):
+            # x should be in the range of [-1, 1]^d
+            # strech periodic dim to so that sin(x * alpha + beta) \in [-1, 1]
+            periodic_dim_scale = args.angle_alpha * jnp.pi
+            return jnp.array([x[0], x[1], jnp.cos(x[2] * periodic_dim_scale), jnp.sin(x[2] * periodic_dim_scale)])
+
+        model = SirenNet(hidden_layers=layers, transform_fn=periodic_transform)
+        num_states = periodic_transform(jnp.ones((1, args.num_states))).shape[-1]
+    else:
+        model = SirenNet(hidden_layers=layers)
+        num_states = args.num_states
+
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=model.init(
+            model_key,
+            jnp.ones((1, num_states)),
+        ),
+        tx=optax.adam(learning_rate=args.lr),
+    )
 
     dataset_state = DatasetState(
         counter=0,
@@ -50,18 +72,8 @@ def main(args):
         t_min=args.t_min, t_max=args.t_max, collision_r=args.collision_r
     )
 
-    key = jax.random.PRNGKey(args.seed)
     key, dataset_key = jax.random.split(key)
     dataset_state, tcoords, gt = dubins_3d_dataset_sampler(dataset_key, dataset_state)
-
-
-    state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=model.init(
-            key, jnp.ones((1, 5)) # 1 for time, 3 for state 1 for periodic transform
-        ),  
-        tx=optax.adam(learning_rate=args.lr),
-    )
 
     ckpt = {"model": state, "config": vars(args)}
 
@@ -96,12 +108,14 @@ def main(args):
 
         # Start plotting the results
         for i in range(num_times):
-            time_coords = np.ones(mgrid_coords.shape[0], 1) * times[i]
+            time_coords = np.ones((mgrid_coords.shape[0], 1)) * times[i]
 
             for j in range(num_thetas):
-                theta_coords = np.ones(mgrid_coords.shape[0], 1) * thetas[j]
+                theta_coords = np.ones((mgrid_coords.shape[0], 1)) * thetas[j]
                 theta_coords = theta_coords / (args.angle_alpha * np.pi)
-                coords = np.cat((time_coords, mgrid_coords, theta_coords), dim=1)
+                coords = np.concatenate(
+                    (time_coords, mgrid_coords, theta_coords), axis=1
+                )
                 model_out = state.apply_fn(state.params, jnp.array(coords))
 
                 model_out = np.array(model_out)
@@ -127,44 +141,40 @@ def main(args):
                 )
                 fig.colorbar(s)
 
-
         wandb.log({"brt": fig}, step=epoch)
         fig.clear()
 
     root_path = os.path.join(args.logging_root, args.experiment_name)
     model_dir = root_path
     import utils
-    summaries_dir = os.path.join(model_dir, "summaries")
-    utils.cond_mkdir(summaries_dir)
-
     checkpoints_dir = os.path.join(model_dir, "checkpoints")
     utils.cond_mkdir(checkpoints_dir)
 
     train_losses = []
     for epoch in tqdm.tqdm(range(args.epochs)):
-        
+
         key, dataset_key = jax.random.split(key)
-        dataset_state, tcoords, gt = dubins_3d_dataset_sampler(dataset_key, dataset_state)
-        state, train_loss = update(state, tcoords, gt['source_boundary_values'], gt['dirichlet_mask'])
+        dataset_state, tcoords, gt = dubins_3d_dataset_sampler(
+            dataset_key, dataset_state
+        )
+        state, train_loss = update(
+            state, tcoords, gt["source_boundary_values"], gt["dirichlet_mask"]
+        )
         train_losses.append(train_loss.item())
 
         if not epoch % args.epochs_till_checkpoint and epoch:
-            # orbax_checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
-            # checkpoints.save_checkpoint(ckpt_dir=
-            #                             target=ckpt,
-            #                             step=epoch,
-            #                             overwrite=False,
-            #                             orbax_checkpointer=orbax_checkpointer)
-            # np.savetxt(
-            #     os.path.join(
-            #         checkpoints_dir, "train_losses_epoch_%04d.txt" % epoch
-            #     ),
-            #     np.array(train_losses),
-            # )
-            wandb.log({'train_loss': train_losses[-1]}, step=epoch)
-            print(f'Epoch: {epoch} train_loss: {train_losses[-1]}')
+            orbax_checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
+            checkpoints.save_checkpoint(ckpt_dir=checkpoints_dir,
+                                        target=ckpt,
+                                        step=epoch,
+                                        overwrite=False,
+                                        keep=2,
+                                        orbax_checkpointer=orbax_checkpointer)
+            wandb.log({"train_loss": train_losses[-1]}, step=epoch)
+            print(f"Epoch: {epoch} train_loss: {train_losses[-1]}")
 
             val_fn(state, checkpoints_dir, epoch)
+
 
 if __name__ in "__main__":
 
@@ -172,6 +182,7 @@ if __name__ in "__main__":
         p = argparse.ArgumentParser()
         # fmt: off
         p.add_argument("--experiment-name", type=str, required=True)
+        p.add_argument("--wandb", action='store_true')
         p.add_argument("--logging-root", type=str, default='logs')
         p.add_argument('--epochs', type=int, default=120_000)
         p.add_argument('--epochs-till-checkpoint', type=int, default=2_000)
@@ -189,6 +200,9 @@ if __name__ in "__main__":
         p.add_argument("--num-nl", type=int, default=512, required=False, 
                        help="Number of neurons per hidden layer.",
         )
+        p.add_argument("--periodic-transform", type=bool, default=False,
+                       help="convert theta to cos(theta) sin(theta)",
+        )
         # brt
         p.add_argument("--min-with", type=str, default="target", required=False, choices=["none", "zero", "target"], 
                        help="BRS vs BRT computation",
@@ -199,9 +213,13 @@ if __name__ in "__main__":
         p.add_argument("--t-max", type=float, default=1.1, required=False, 
                        help="End time of the simulation"
         )
-        # dynamics
+        # initial value function
         p.add_argument("--collision-r", type=float, default=0.25, required=False, 
                        help="Collision radius between vehicles",
+        )
+        # dynamics
+        p.add_argument("--num-states", type=int, default=4, required=False, 
+                       help="Number of states in system including time",
         )
         p.add_argument("--angle-alpha", type=float, default=1.2, required=False, 
                        help="Angle alpha coefficient.",
@@ -220,10 +238,6 @@ if __name__ in "__main__":
 
     args = get_args()
 
-    wandb.init(
-        project='deepreach_jax',
-        entity='mlu',
-        config=vars(args),
-        save_code=True
-    )
+    if args.wandb:
+        wandb.init(project="deepreach_jax", entity="mlu", config=vars(args), save_code=True)
     main(args)
