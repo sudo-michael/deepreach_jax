@@ -4,7 +4,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
-import math
 import argparse
 
 import os
@@ -13,21 +12,55 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 from modules import SirenNet
 import optax
-import orbax.checkpoint as orbax
 import jax
 import jax.numpy as jnp
 from flax.training import train_state
-from flax.training import checkpoints
+from flax import struct
 
-from dataio import DatasetState, create_dubins_3d_dataset_sampler, xy_grid
-from loss_functions import initialize_hji_air3D
-
-import tqdm
+from dataio import create_dataset_sampler, xy_grid
+from loss_functions import initialize_hji_loss
+from utils import unormalize_value_function, normalize_value_function, cond_mkdir
 
 import wandb
+from train import train
+
+
+@struct.dataclass
+class DatasetState:
+    counter: int
+    pretrain_end: int  # for only training ground truth value function at t=t_min
+    counter_end: int  # when time can finally be sampled at t_max
+    batch_size: int
+    samples_at_t_min: int
+    t_min: float
+    t_max: float
+    # dynamics
+    velocity: float
+    omega_max: float
+    # initial value function
+    collision_r: float
+    # normalize state space into range [-1, 1]
+    alpha: dict
+    beta: dict
+    # value function normaliziation
+    norm_to: float = 0.02
+    mean: float = 0.25
+    var: float = 0.5
 
 
 def main(args):
+    # normalization from world space to [-1, 1]^d
+    alpha = {
+        "x": 1.0,
+        "y": 1.0,
+        "theta": args.angle_alpha * np.pi,
+    }
+    beta = {
+        "x": 0.0,
+        "y": 0.0,
+        "theta": 0.0,
+    }
+
 
     key = jax.random.PRNGKey(args.seed)
     key, model_key = jax.random.split(key)
@@ -36,11 +69,19 @@ def main(args):
     if args.periodic_transform:
 
         @jax.vmap
-        def periodic_transform(x):
+        def periodic_transform(tcoords):
             # x should be in the range of [-1, 1]^d
             # strech periodic dim to so that sin(x * alpha + beta) \in [-1, 1]
-            periodic_dim_scale = args.angle_alpha * jnp.pi
-            return jnp.array([x[0], x[1], jnp.cos(x[2] * periodic_dim_scale), jnp.sin(x[2] * periodic_dim_scale)])
+            periodic_dim_scale = alpha['theta'] + beta['theta']
+            return jnp.array(
+                [
+                    tcoords[0], # t
+                    tcoords[1], # x
+                    tcoords[2], # y
+                    jnp.cos(tcoords[3] * periodic_dim_scale), # cos(theta)
+                    jnp.sin(tcoords[3] * periodic_dim_scale), # sin(theta)
+                ]
+            )
 
         model = SirenNet(hidden_layers=layers, transform_fn=periodic_transform)
         num_states = periodic_transform(jnp.ones((1, args.num_states))).shape[-1]
@@ -63,34 +104,76 @@ def main(args):
         counter_end=args.counter_end,
         batch_size=args.batch_size,
         samples_at_t_min=args.samples_at_t_min,
+        t_min=args.t_min,
+        t_max=args.t_max,
         velocity=args.velocity,
         omega_max=args.omega_max,
-        angle_alpha=args.angle_alpha * np.pi,
+        collision_r=args.collision_r,
+        alpha=alpha,
+        beta=beta,
     )
 
-    dubins_3d_dataset_sampler = create_dubins_3d_dataset_sampler(
-        t_min=args.t_min, t_max=args.t_max, collision_r=args.collision_r
+    def unnormalize_tcoords(normalized_tcoord):
+        # [-1, 1]^d to global frame
+        alpha = jnp.array([1, dataset_state.alpha["x"], dataset_state.alpha["y"], dataset_state.alpha["theta"]])
+        beta = jnp.array([0, dataset_state.beta["x"], dataset_state.beta["y"], dataset_state.beta["theta"]])
+        return normalized_tcoord * alpha + beta
+
+    def normalize_tcoords(unnormalized_tcoord):
+        # global frame to [-1, 1]^d
+        alpha = jnp.array([1, dataset_state.alpha["x"], dataset_state.alpha["y"], dataset_state.alpha["theta"]])
+        beta = jnp.array([0, dataset_state.beta["x"], dataset_state.beta["y"], dataset_state.beta["theta"]])
+        return (unnormalized_tcoord - beta) / alpha
+
+    @jax.vmap
+    def initial_value_function(normalized_tcoords):
+        tcoords = unnormalize_tcoords(normalized_tcoords)
+        lx = jnp.linalg.norm(tcoords[1:3]) - dataset_state.collision_r
+        lx = normalize_value_function(
+            lx, dataset_state.norm_to, dataset_state.mean, dataset_state.var
+        )
+        return lx
+
+    def scale_costates(dVdx):
+        alpha = jnp.array([dataset_state.alpha["x"], dataset_state.alpha["y"], dataset_state.alpha["theta"]])
+        return dVdx / alpha
+
+    @jax.vmap
+    def compute_hamiltonian(nablaV, normalized_tcoords):
+        # Air3D dynamics
+        # \dot x    = -v_a + v_b \cos \psi + a y
+        # \dot y    = v_b \sin \psi - a x
+        # \dot \psi = b - a
+        tcoords = unnormalize_tcoords(normalized_tcoords) # (t x y theta)
+
+        dVdx = nablaV[1:]  # (x y theta)
+
+        # TODO understand why we scale dVdx
+        dVdx = scale_costates(dVdx)
+
+
+        ham = dataset_state.omega_max * jnp.abs(
+            dVdx[0] * tcoords[2] - dVdx[1] * tcoords[1] - dVdx[2]
+        )  # Control component
+
+        ham = ham - dataset_state.omega_max * jnp.abs(dVdx[2])  # Disturbance component
+        ham = (
+            ham
+            + (dataset_state.velocity * (jnp.cos(tcoords[3]) - 1.0) * dVdx[0])
+            + (dataset_state.velocity * jnp.sin(tcoords[3]) * dVdx[1])
+        )  # Constant component
+        return ham
+
+    dubins_3d_dataset_sampler = create_dataset_sampler(
+        initial_value_function, args.num_states
     )
 
-    key, dataset_key = jax.random.split(key)
-    dataset_state, tcoords, gt = dubins_3d_dataset_sampler(dataset_key, dataset_state)
-
-    ckpt = {"model": state, "config": vars(args)}
+    ckpt = {"model": state, "config": vars(args), "dataset": dataset_state}
 
     # Define the loss
-    loss_fn = initialize_hji_air3D(state, dataset_state, args.min_with)
+    loss_fn = initialize_hji_loss(state, args.min_with, compute_hamiltonian)
 
-    @jax.jit
-    def update(state, tcoords, source_boundary_values, dirichlet_mask):
-        loss, grads = jax.value_and_grad(loss_fn)(
-            state.params, tcoords, source_boundary_values, dirichlet_mask
-        )
-        state = state.apply_gradients(grads=grads)
-        return state, loss
-
-    root_path = os.path.join(args.logging_root, args.experiment_name)
-
-    def val_fn(state, ckpt_dir, epoch):
+    def val_fn(state, epoch):
         # Time values at which the function needs to be plotted
         times = [0.0, 0.5 * (args.t_max - 0.1), (args.t_max - 0.1)]
         num_times = len(times)
@@ -112,29 +195,27 @@ def main(args):
 
             for j in range(num_thetas):
                 theta_coords = np.ones((mgrid_coords.shape[0], 1)) * thetas[j]
-                theta_coords = theta_coords / (args.angle_alpha * np.pi)
-                coords = np.concatenate(
+                unnormalized_tcoords = np.concatenate(
                     (time_coords, mgrid_coords, theta_coords), axis=1
                 )
-                model_out = state.apply_fn(state.params, jnp.array(coords))
 
-                model_out = np.array(model_out)
-                model_out = model_out.reshape((grid_points, grid_points))
+                V = state.apply_fn(state.params, jnp.array(normalize_tcoords(unnormalized_tcoords)))
 
-                # Unnormalize the value function
-                norm_to = 0.02
-                mean = 0.25
-                var = 0.5
-                model_out = (model_out * var / norm_to) + mean
+                V = np.array(V)
+                V = V.reshape((grid_points, grid_points))
+
+                V = unormalize_value_function(
+                    V, dataset_state.norm_to, dataset_state.mean, dataset_state.var
+                )
 
                 # Plot the zero level sets
-                model_out = (model_out <= 0.001) * 1.0
+                V = (V <= 0.001) * 1.0
 
                 # Plot the actual data
                 ax = fig.add_subplot(num_times, num_thetas, (j + 1) + i * num_thetas)
                 ax.set_title("t = %0.2f, theta = %0.2f" % (times[i], thetas[j]))
                 s = ax.imshow(
-                    model_out.T,
+                    V.T,
                     cmap="bwr",
                     origin="lower",
                     extent=(-1.0, 1.0, -1.0, 1.0),
@@ -142,38 +223,21 @@ def main(args):
                 fig.colorbar(s)
 
         wandb.log({"brt": fig}, step=epoch)
-        fig.clear()
+        plt.close()
 
-    root_path = os.path.join(args.logging_root, args.experiment_name)
-    model_dir = root_path
-    import utils
-    checkpoints_dir = os.path.join(model_dir, "checkpoints")
-    utils.cond_mkdir(checkpoints_dir)
-
-    train_losses = []
-    for epoch in tqdm.tqdm(range(args.epochs)):
-
-        key, dataset_key = jax.random.split(key)
-        dataset_state, tcoords, gt = dubins_3d_dataset_sampler(
-            dataset_key, dataset_state
-        )
-        state, train_loss = update(
-            state, tcoords, gt["source_boundary_values"], gt["dirichlet_mask"]
-        )
-        train_losses.append(train_loss.item())
-
-        if not epoch % args.epochs_till_checkpoint and epoch:
-            orbax_checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
-            checkpoints.save_checkpoint(ckpt_dir=checkpoints_dir,
-                                        target=ckpt,
-                                        step=epoch,
-                                        overwrite=False,
-                                        keep=2,
-                                        orbax_checkpointer=orbax_checkpointer)
-            wandb.log({"train_loss": train_losses[-1]}, step=epoch)
-            print(f"Epoch: {epoch} train_loss: {train_losses[-1]}")
-
-            val_fn(state, checkpoints_dir, epoch)
+    train(
+        key,
+        state,
+        dataset_state,
+        loss_fn,
+        val_fn,
+        dubins_3d_dataset_sampler,
+        ckpt,
+        args.epochs,
+        args.epochs_till_checkpoint,
+        args.logging_root,
+        args.experiment_name,
+    )
 
 
 if __name__ in "__main__":
@@ -200,7 +264,7 @@ if __name__ in "__main__":
         p.add_argument("--num-nl", type=int, default=512, required=False, 
                        help="Number of neurons per hidden layer.",
         )
-        p.add_argument("--periodic-transform", type=bool, default=False,
+        p.add_argument("--periodic-transform", action='store_true',
                        help="convert theta to cos(theta) sin(theta)",
         )
         # brt
@@ -239,5 +303,7 @@ if __name__ in "__main__":
     args = get_args()
 
     if args.wandb:
-        wandb.init(project="deepreach_jax", entity="mlu", config=vars(args), save_code=True)
+        wandb.init(
+            project="deepreach_jax", entity="mlu", config=vars(args), save_code=True
+        )
     main(args)
