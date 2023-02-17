@@ -24,6 +24,9 @@ from utils import unormalize_value_function, normalize_value_function, cond_mkdi
 import wandb
 from train import train
 
+import orbax.checkpoint as orbax
+from flax.training import checkpoints
+
 
 @struct.dataclass
 class DatasetState:
@@ -61,7 +64,6 @@ def main(args):
         "theta": 0.0,
     }
 
-
     key = jax.random.PRNGKey(args.seed)
     key, model_key = jax.random.split(key)
     layers = [args.num_nl for _ in range(args.num_hl)]
@@ -69,17 +71,17 @@ def main(args):
     if args.periodic_transform:
 
         @jax.vmap
-        def periodic_transform(tcoords):
+        def periodic_transform(normalized_tcoords):
             # x should be in the range of [-1, 1]^d
             # strech periodic dim to so that sin(x * alpha + beta) \in [-1, 1]
-            periodic_dim_scale = alpha['theta'] + beta['theta']
+            periodic_dim_scale = alpha["theta"] + beta["theta"]
             return jnp.array(
                 [
-                    tcoords[0], # t
-                    tcoords[1], # x
-                    tcoords[2], # y
-                    jnp.cos(tcoords[3] * periodic_dim_scale), # cos(theta)
-                    jnp.sin(tcoords[3] * periodic_dim_scale), # sin(theta)
+                    normalized_tcoords[0],  # t
+                    normalized_tcoords[1],  # x
+                    normalized_tcoords[2],  # y
+                    jnp.cos(normalized_tcoords[3] * periodic_dim_scale),  # cos(theta)
+                    jnp.sin(normalized_tcoords[3] * periodic_dim_scale),  # sin(theta)
                 ]
             )
 
@@ -113,16 +115,46 @@ def main(args):
         beta=beta,
     )
 
+    ckpt = {"model": state, "config": vars(args), "dataset": dataset_state}
+
     def unnormalize_tcoords(normalized_tcoord):
         # [-1, 1]^d to global frame
-        alpha = jnp.array([1, dataset_state.alpha["x"], dataset_state.alpha["y"], dataset_state.alpha["theta"]])
-        beta = jnp.array([0, dataset_state.beta["x"], dataset_state.beta["y"], dataset_state.beta["theta"]])
+        alpha = jnp.array(
+            [
+                1,
+                dataset_state.alpha["x"],
+                dataset_state.alpha["y"],
+                dataset_state.alpha["theta"],
+            ]
+        )
+        beta = jnp.array(
+            [
+                0,
+                dataset_state.beta["x"],
+                dataset_state.beta["y"],
+                dataset_state.beta["theta"],
+            ]
+        )
         return normalized_tcoord * alpha + beta
 
     def normalize_tcoords(unnormalized_tcoord):
         # global frame to [-1, 1]^d
-        alpha = jnp.array([1, dataset_state.alpha["x"], dataset_state.alpha["y"], dataset_state.alpha["theta"]])
-        beta = jnp.array([0, dataset_state.beta["x"], dataset_state.beta["y"], dataset_state.beta["theta"]])
+        alpha = jnp.array(
+            [
+                1,
+                dataset_state.alpha["x"],
+                dataset_state.alpha["y"],
+                dataset_state.alpha["theta"],
+            ]
+        )
+        beta = jnp.array(
+            [
+                0,
+                dataset_state.beta["x"],
+                dataset_state.beta["y"],
+                dataset_state.beta["theta"],
+            ]
+        )
         return (unnormalized_tcoord - beta) / alpha
 
     @jax.vmap
@@ -135,7 +167,13 @@ def main(args):
         return lx
 
     def scale_costates(dVdx):
-        alpha = jnp.array([dataset_state.alpha["x"], dataset_state.alpha["y"], dataset_state.alpha["theta"]])
+        alpha = jnp.array(
+            [
+                dataset_state.alpha["x"],
+                dataset_state.alpha["y"],
+                dataset_state.alpha["theta"],
+            ]
+        )
         return dVdx / alpha
 
     @jax.vmap
@@ -144,13 +182,12 @@ def main(args):
         # \dot x    = -v_a + v_b \cos \psi + a y
         # \dot y    = v_b \sin \psi - a x
         # \dot \psi = b - a
-        tcoords = unnormalize_tcoords(normalized_tcoords) # (t x y theta)
+        tcoords = unnormalize_tcoords(normalized_tcoords)  # (t x y theta)
 
         dVdx = nablaV[1:]  # (x y theta)
 
         # TODO understand why we scale dVdx
         dVdx = scale_costates(dVdx)
-
 
         ham = dataset_state.omega_max * jnp.abs(
             dVdx[0] * tcoords[2] - dVdx[1] * tcoords[1] - dVdx[2]
@@ -168,38 +205,44 @@ def main(args):
         initial_value_function, args.num_states
     )
 
-    ckpt = {"model": state, "config": vars(args), "dataset": dataset_state}
-
     # Define the loss
     loss_fn = initialize_hji_loss(state, args.min_with, compute_hamiltonian)
 
     def val_fn(state, epoch):
-        # Time values at which the function needs to be plotted
         times = [0.0, 0.5 * (args.t_max - 0.1), (args.t_max - 0.1)]
-        num_times = len(times)
-
-        # Theta slices to be plotted
-        thetas = [-np.pi, -0.5 * np.pi, 0.0, 0.5 * np.pi, np.pi]
-        num_thetas = len(thetas)
+        slices = [
+            {"theta": -np.pi},
+            {"theta": -0.5 * np.pi},
+            {"theta": -0.0},
+            {"theta": -0.5 * np.pi},
+            {"theta": np.pi},
+        ]
 
         # Create a figure
-        fig = plt.figure(figsize=(5 * num_times, 5 * num_thetas))
+        # fig = plt.figure(figsize=(5 * num_times, 5 * num_thetas))
+        fig, ax = plt.subplots(
+            nrows=len(times),
+            ncols=len(slices),
+            sharex=True,
+            sharey=True,
+            figsize=(5 * len(slices), 5 * len(times)),
+            # constrained_layout=True
+        )
 
         # Get the meshgrid in the (x, y) coordinate
         grid_points = 200
         mgrid_coords = xy_grid(200)
 
-        # Start plotting the results
-        for i in range(num_times):
-            time_coords = np.ones((mgrid_coords.shape[0], 1)) * times[i]
-
-            for j in range(num_thetas):
-                theta_coords = np.ones((mgrid_coords.shape[0], 1)) * thetas[j]
+        for time, row in zip(times, ax):
+            for slice, col in zip(slices, row):
+                time_coords = np.ones((mgrid_coords.shape[0], 1)) * time
+                theta_coords = np.ones((mgrid_coords.shape[0], 1)) * slice["theta"]
                 unnormalized_tcoords = np.concatenate(
                     (time_coords, mgrid_coords, theta_coords), axis=1
                 )
-
-                V = state.apply_fn(state.params, jnp.array(normalize_tcoords(unnormalized_tcoords)))
+                V = state.apply_fn(
+                    state.params, jnp.array(normalize_tcoords(unnormalized_tcoords))
+                )
 
                 V = np.array(V)
                 V = V.reshape((grid_points, grid_points))
@@ -212,32 +255,37 @@ def main(args):
                 V = (V <= 0.001) * 1.0
 
                 # Plot the actual data
-                ax = fig.add_subplot(num_times, num_thetas, (j + 1) + i * num_thetas)
-                ax.set_title("t = %0.2f, theta = %0.2f" % (times[i], thetas[j]))
-                s = ax.imshow(
+                im = col.imshow(
                     V.T,
                     cmap="bwr",
                     origin="lower",
                     extent=(-1.0, 1.0, -1.0, 1.0),
                 )
-                fig.colorbar(s)
+                col.set_title(f"t={time:0.2f}, theta={slice['theta']:0.2f}")
+                # fig.colorbar(s)
 
-        wandb.log({"brt": fig}, step=epoch)
-        plt.close()
+        fig.colorbar(im, ax=ax.ravel().tolist())
+        fig.savefig("test1", bbox_inches='tight')
+        plt.close(fig)
 
-    train(
-        key,
-        state,
-        dataset_state,
-        loss_fn,
-        val_fn,
-        dubins_3d_dataset_sampler,
-        ckpt,
-        args.epochs,
-        args.epochs_till_checkpoint,
-        args.logging_root,
-        args.experiment_name,
-    )
+    if args.validate:
+        # ckpt_dir = os.path.join(args.logging_root, args.experiment_name)
+        # ckpt = checkpoints.restore_checkpoint(ckpt_dir, target=ckpt)
+        val_fn(state, 0)
+    else:
+        train(
+            key,
+            state,
+            dataset_state,
+            loss_fn,
+            val_fn,
+            dubins_3d_dataset_sampler,
+            ckpt,
+            args.epochs,
+            args.epochs_till_checkpoint,
+            args.logging_root,
+            args.experiment_name,
+        )
 
 
 if __name__ in "__main__":
@@ -248,7 +296,7 @@ if __name__ in "__main__":
         p.add_argument("--experiment-name", type=str, required=True)
         p.add_argument("--wandb", action='store_true')
         p.add_argument("--logging-root", type=str, default='logs')
-        p.add_argument('--epochs', type=int, default=120_000)
+        p.add_argument('--epochs', type=int, default=100_000)
         p.add_argument('--epochs-till-checkpoint', type=int, default=2_000)
         p.add_argument('--pretrain-end', type=int, default=2_000)
         p.add_argument('--counter-end', type=int, default=110_000)
@@ -256,7 +304,7 @@ if __name__ in "__main__":
         p.add_argument('--samples-at-t-min', type=int, default=10_000)
         p.add_argument('--lr', type=float, default=2e-5)
         p.add_argument('--seed', type=int, default=1)
-
+        p.add_argument("--validate", action='store_true')
         # siren
         p.add_argument("--num-hl", type=int, default=2, required=False, 
                        help="The number of hidden layers"
@@ -274,7 +322,7 @@ if __name__ in "__main__":
         p.add_argument("--t-min", type=float, default=0.0, required=False, 
                        help="Start time of the simulation",
         )
-        p.add_argument("--t-max", type=float, default=1.1, required=False, 
+        p.add_argument("--t-max", type=float, default=1.0, required=False, 
                        help="End time of the simulation"
         )
         # initial value function
@@ -288,10 +336,10 @@ if __name__ in "__main__":
         p.add_argument("--angle-alpha", type=float, default=1.2, required=False, 
                        help="Angle alpha coefficient.",
         )
-        p.add_argument("--velocity", type=float, default=0.75, required=False, 
+        p.add_argument("--velocity", type=float, default=0.6, required=False, 
                        help="Speed of the dubins car",
         )
-        p.add_argument("--omega-max", type=float, default=3.0, required=False, 
+        p.add_argument("--omega-max", type=float, default=1.1, required=False, 
                        help="Turn rate of the car") 
         # fmt: on
         args = p.parse_args()

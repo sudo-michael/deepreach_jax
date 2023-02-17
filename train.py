@@ -55,11 +55,12 @@ def train(
         if not epoch % epochs_till_checkpoint and epoch:
             orbax_checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
             ckpt["dataset"] = dataset_state
+            ckpt["model"] = state
             checkpoints.save_checkpoint(
                 ckpt_dir=checkpoints_dir,
                 target=ckpt,
                 step=epoch,
-                overwrite=False,
+                overwrite=True,
                 keep=2,
                 orbax_checkpointer=orbax_checkpointer,
             )
