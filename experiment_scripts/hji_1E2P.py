@@ -10,13 +10,19 @@ import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-from modules import SirenNet
 import optax
 import jax
 import jax.numpy as jnp
 from flax.training import train_state
 from flax import struct
 
+
+import sys
+# TODO: make this into a package with setuptools
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+
+from modules import SirenNet
 from dataio import create_dataset_sampler, xy_grid
 from loss_functions import initialize_hji_loss
 from utils import unormalize_value_function, normalize_value_function, cond_mkdir
@@ -38,8 +44,10 @@ class DatasetState:
     t_min: float
     t_max: float
     # dynamics
-    velocity: float
-    omega_max: float
+    velocity_evader: float
+    velocity_persuer: float
+    omega_evader: float
+    omega_persuer: float
     # initial value function
     collision_r: float
     # normalize state space into range [-1, 1]
@@ -54,8 +62,8 @@ class DatasetState:
 def main(args):
     # normalization from world space to [-1, 1]^d
     alpha = {
-        "x": 1.0,
-        "y": 1.0,
+        "x": 5.0,
+        "y": 5.0,
         "theta": args.angle_alpha * np.pi,
     }
     beta = {
@@ -78,10 +86,26 @@ def main(args):
             return jnp.array(
                 [
                     normalized_tcoords[0],  # t
-                    normalized_tcoords[1],  # x
-                    normalized_tcoords[2],  # y
-                    jnp.cos(normalized_tcoords[3] * periodic_dim_scale),  # cos(theta)
-                    jnp.sin(normalized_tcoords[3] * periodic_dim_scale),  # sin(theta)
+                    normalized_tcoords[1],  # x_e
+                    normalized_tcoords[2],  # y_e
+                    normalized_tcoords[3],  # x_p1
+                    normalized_tcoords[4],  # y_p1
+                    normalized_tcoords[5],  # x_p2
+                    normalized_tcoords[6],  # y_p2
+                    jnp.cos(normalized_tcoords[7] * periodic_dim_scale),  # cos(theta_e)
+                    jnp.sin(normalized_tcoords[7] * periodic_dim_scale),  # sin(theta_e)
+                    jnp.cos(
+                        normalized_tcoords[8] * periodic_dim_scale
+                    ),  # cos(theta_p1)
+                    jnp.sin(
+                        normalized_tcoords[8] * periodic_dim_scale
+                    ),  # sin(theta_p1)
+                    jnp.cos(
+                        normalized_tcoords[9] * periodic_dim_scale
+                    ),  # cos(theta_p2)
+                    jnp.sin(
+                        normalized_tcoords[9] * periodic_dim_scale
+                    ),  # sin(theta_p2)
                 ]
             )
 
@@ -108,8 +132,10 @@ def main(args):
         samples_at_t_min=args.samples_at_t_min,
         t_min=args.t_min,
         t_max=args.t_max,
-        velocity=args.velocity,
-        omega_max=args.omega_max,
+        velocity_evader=args.velocity_e,
+        velocity_persuer=args.velocity_p,
+        omega_evader=args.omega_e,
+        omega_persuer=args.omega_p,
         collision_r=args.collision_r,
         alpha=alpha,
         beta=beta,
@@ -117,88 +143,97 @@ def main(args):
 
     ckpt = {"model": state, "config": vars(args), "dataset": dataset_state}
 
+    alpha = jnp.array(
+        [
+            1,
+            dataset_state.alpha["x"],
+            dataset_state.alpha["y"],
+            dataset_state.alpha["x"],
+            dataset_state.alpha["y"],
+            dataset_state.alpha["x"],
+            dataset_state.alpha["y"],
+            dataset_state.alpha["theta"],
+            dataset_state.alpha["theta"],
+            dataset_state.alpha["theta"],
+        ]
+    )
+
+    beta = jnp.array(
+        [
+            0,
+            dataset_state.beta["x"],
+            dataset_state.beta["y"],
+            dataset_state.beta["x"],
+            dataset_state.beta["y"],
+            dataset_state.beta["x"],
+            dataset_state.beta["y"],
+            dataset_state.beta["theta"],
+            dataset_state.beta["theta"],
+            dataset_state.beta["theta"],
+        ]
+    )
+
     def unnormalize_tcoords(normalized_tcoord):
         # [-1, 1]^d to global frame
-        alpha = jnp.array(
-            [
-                1,
-                dataset_state.alpha["x"],
-                dataset_state.alpha["y"],
-                dataset_state.alpha["theta"],
-            ]
-        )
-        beta = jnp.array(
-            [
-                0,
-                dataset_state.beta["x"],
-                dataset_state.beta["y"],
-                dataset_state.beta["theta"],
-            ]
-        )
         return normalized_tcoord * alpha + beta
 
     def normalize_tcoords(unnormalized_tcoord):
         # global frame to [-1, 1]^d
-        alpha = jnp.array(
-            [
-                1,
-                dataset_state.alpha["x"],
-                dataset_state.alpha["y"],
-                dataset_state.alpha["theta"],
-            ]
-        )
-        beta = jnp.array(
-            [
-                0,
-                dataset_state.beta["x"],
-                dataset_state.beta["y"],
-                dataset_state.beta["theta"],
-            ]
-        )
         return (unnormalized_tcoord - beta) / alpha
 
     @jax.vmap
     def initial_value_function(normalized_tcoords):
+        # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
+        # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
+
         tcoords = unnormalize_tcoords(normalized_tcoords)
-        lx = jnp.linalg.norm(tcoords[1:3]) - dataset_state.collision_r
+        lx1 = jnp.linalg.norm(tcoords[1:3] - tcoords[3:5]) - dataset_state.collision_r
+        lx2 = jnp.linalg.norm(tcoords[1:3] - tcoords[5:7]) - dataset_state.collision_r
+        lx = jnp.minimum(lx1, lx2)
         lx = normalize_value_function(
             lx, dataset_state.norm_to, dataset_state.mean, dataset_state.var
         )
         return lx
 
     def scale_costates(dVdx):
-        alpha = jnp.array(
-            [
-                dataset_state.alpha["x"],
-                dataset_state.alpha["y"],
-                dataset_state.alpha["theta"],
-            ]
-        )
-        return dVdx / alpha
+        return dVdx / alpha[1:]
 
     @jax.vmap
     def compute_hamiltonian(nablaV, normalized_tcoords):
-        # Air3D dynamics
-        # \dot x    = -v_a + v_b \cos \psi + a y
-        # \dot y    = v_b \sin \psi - a x
-        # \dot \psi = b - a
-        tcoords = unnormalize_tcoords(normalized_tcoords)  # (t x y theta)
+        tcoords = unnormalize_tcoords(normalized_tcoords)
+        # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
+        # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
 
         dVdx = nablaV[1:]  # (x y theta)
 
         # TODO understand why we scale dVdx
         dVdx = scale_costates(dVdx)
 
-        ham = dataset_state.omega_max * jnp.abs(
-            dVdx[0] * tcoords[2] - dVdx[1] * tcoords[1] - dVdx[2]
-        )  # Control component
+        dVdx_e, dVdy_e, dVdtheta_e = dVdx[0], dVdx[1], dVdx[6]
+        dVdx_p1, dVdy_p1, dVdtheta_p1 = dVdx[2], dVdx[3], dVdx[7]
+        dVdx_p2, dVdy_p2, dVdtheta_p2 = dVdx[4], dVdx[5], dVdx[8]
 
-        ham = ham - dataset_state.omega_max * jnp.abs(dVdx[2])  # Disturbance component
-        ham = (
-            ham
-            + (dataset_state.velocity * (jnp.cos(tcoords[3]) - 1.0) * dVdx[0])
-            + (dataset_state.velocity * jnp.sin(tcoords[3]) * dVdx[1])
-        )  # Constant component
+        x_e, y_e, theta_e = tcoords[1], tcoords[2], tcoords[7]
+        x_p1, y_p1, theta_p1 = tcoords[3], tcoords[4], tcoords[8]
+        x_p2, y_p2, theta_p2 = tcoords[5], tcoords[6], tcoords[9]
+
+        ham_evader = dataset_state.velocity_evader * dVdx_e * jnp.cos(
+            theta_e
+        ) + dataset_state.velocity_evader * dVdy_e * jnp.sin(theta_e)
+        ham_evader = ham_evader + dataset_state.omega_evader * jnp.abs(dVdtheta_e)
+
+        ham_persuer1 = dataset_state.velocity_persuer * dVdx_p1 * jnp.cos(
+            theta_p1
+        ) + dataset_state.velocity_persuer * dVdy_p1 * jnp.sin(theta_p1)
+        ham_persuer1 = ham_persuer1 - dataset_state.omega_persuer * jnp.abs(dVdtheta_p1)
+
+        ham_persuer2 = dataset_state.velocity_persuer * dVdx_p2 * jnp.cos(
+            theta_p2
+        ) + dataset_state.velocity_persuer * dVdy_p2 * jnp.sin(theta_p2)
+        ham_persuer2 = ham_persuer2 - dataset_state.omega_persuer * jnp.abs(dVdtheta_p2)
+
+        ham = ham_evader + ham_persuer1 + ham_persuer2
+
         return ham
 
     dubins_3d_dataset_sampler = create_dataset_sampler(
@@ -210,16 +245,19 @@ def main(args):
 
     def val_fn(state, epoch):
         times = [0.0, 0.5 * (args.t_max - 0.1), (args.t_max - 0.1)]
+        x_p1s = [-1, -1, -1, -1]
+        y_p1s = [0, 0, 0, 0]
+        x_p2s = [1, 1, 1, 1]
+        y_p2s = [0, 0, 0, 0]
+        theta_es = [0, np.pi / 2, -np.pi, -np.pi / 2]
+        theta_p1s = [0, 0, 0, 0]
+        theta_p2s = [-np.pi, -np.pi, -np.pi, -np.pi]
+        keys = ["x_p1", "y_p1", "x_p2", "y_p2", "theta_e", "theta_p1", "theta_p2"]
         slices = [
-            {"theta": -np.pi},
-            {"theta": -0.5 * np.pi},
-            {"theta": -0.0},
-            {"theta": -0.5 * np.pi},
-            {"theta": np.pi},
+            dict(zip(keys, items))
+            for items in zip(x_p1s, y_p1s, x_p2s, y_p2s, theta_es, theta_p1s, theta_p2s)
         ]
 
-        # Create a figure
-        # fig = plt.figure(figsize=(5 * num_times, 5 * num_thetas))
         fig, ax = plt.subplots(
             nrows=len(times),
             ncols=len(slices),
@@ -235,10 +273,29 @@ def main(args):
 
         for time, row in zip(times, ax):
             for slice, col in zip(slices, row):
-                time_coords = np.ones((mgrid_coords.shape[0], 1)) * time
-                theta_coords = np.ones((mgrid_coords.shape[0], 1)) * slice["theta"]
+                ones = np.ones((mgrid_coords.shape[0], 1))
+                time_coords = ones * time
+                theta_evader = ones * slice["theta_e"]
+                x_p1 = ones * slice["x_p1"]
+                y_p1 = ones * slice["y_p1"]
+                x_p2 = ones * slice["x_p2"]
+                y_p2 = ones * slice["y_p2"]
+                theta_evader = ones * slice["theta_e"]
+                theta_p1 = ones * slice["theta_p1"]
+                theta_p2 = ones * slice["theta_p2"]
                 unnormalized_tcoords = np.concatenate(
-                    (time_coords, mgrid_coords, theta_coords), axis=1
+                    (
+                        time_coords,
+                        mgrid_coords,
+                        x_p1,
+                        y_p1,
+                        x_p2,
+                        y_p2,
+                        theta_evader,
+                        theta_p1,
+                        theta_p2,
+                    ),
+                    axis=1,
                 )
                 V = state.apply_fn(
                     state.params, jnp.array(normalize_tcoords(unnormalized_tcoords))
@@ -261,11 +318,12 @@ def main(args):
                     origin="lower",
                     extent=(-1.0, 1.0, -1.0, 1.0),
                 )
-                col.set_title(f"t={time:0.2f}, theta={slice['theta']:0.2f}")
+                col.set_title(f"t={time:0.2f}, te={slice['theta_e']:0.2f}, tp1={slice['theta_p1']:0.2f} tp2={slice['theta_p2']:0.2f}")
                 # fig.colorbar(s)
 
+        fig.suptitle('x=0, y=0, xp1=-1, yp2=0, xp2=1, yp2=0')
         fig.colorbar(im, ax=ax.ravel().tolist())
-        fig.savefig("test1", bbox_inches='tight')
+        wandb.log({"brt": fig}, step=epoch)
         plt.close(fig)
 
     if args.validate:
@@ -322,7 +380,7 @@ if __name__ in "__main__":
         p.add_argument("--t-min", type=float, default=0.0, required=False, 
                        help="Start time of the simulation",
         )
-        p.add_argument("--t-max", type=float, default=1.0, required=False, 
+        p.add_argument("--t-max", type=float, default=1.1, required=False, 
                        help="End time of the simulation"
         )
         # initial value function
@@ -330,17 +388,22 @@ if __name__ in "__main__":
                        help="Collision radius between vehicles",
         )
         # dynamics
-        p.add_argument("--num-states", type=int, default=4, required=False, 
+        p.add_argument("--num-states", type=int, default=10, required=False, 
                        help="Number of states in system including time",
         )
         p.add_argument("--angle-alpha", type=float, default=1.2, required=False, 
                        help="Angle alpha coefficient.",
         )
-        p.add_argument("--velocity", type=float, default=0.6, required=False, 
-                       help="Speed of the dubins car",
+        p.add_argument("--velocity-e", type=float, default=0.3, required=False, 
+                       help="Velocity of Evader",
         )
-        p.add_argument("--omega-max", type=float, default=1.1, required=False, 
-                       help="Turn rate of the car") 
+        p.add_argument("--velocity-p", type=float, default=0.6, required=False, 
+                       help="Velocity of Persuer",
+        )
+        p.add_argument("--omega-e", type=float, default=1.1, required=False, 
+                       help="Turn Rate of Evader") 
+        p.add_argument("--omega-p", type=float, default=1.1, required=False, 
+                       help="Turn Rate of Persuer") 
         # fmt: on
         args = p.parse_args()
 
@@ -352,6 +415,6 @@ if __name__ in "__main__":
 
     if args.wandb:
         wandb.init(
-            project="deepreach_jax", entity="mlu", config=vars(args), save_code=True
+            project="deepreach_jax", entity="mlu", config=vars(args), save_code=True, tags=['1E2P']
         )
     main(args)

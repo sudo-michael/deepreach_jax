@@ -47,3 +47,12 @@ def initialize_hji_loss(state, min_with, compute_hamiltonian):
         }
 
     return hji_loss
+
+def initialize_opt_ctrl_fn(state, compute_opt_ctrl_fn):
+    # @jax.jit
+    def opt_ctrl_fn(
+        params, normalized_tcoords
+    ):
+        nablaV, _ = jacobian(state.apply_fn, params, normalized_tcoords)
+        return compute_opt_ctrl_fn(nablaV)
+    return opt_ctrl_fn
