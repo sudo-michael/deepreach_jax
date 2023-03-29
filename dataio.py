@@ -2,15 +2,13 @@ import jax
 import jax.numpy as jnp
 
 
-def xy_grid(grid_points):
-    """Createes a grid of size (grid_points**2, 2) in the range of [-1, 1]^2"""
-    grid_space = jnp.linspace(0, 1, num=grid_points)
-    X, Y = jnp.meshgrid(grid_space, grid_space, indexing="ij")
+def xy_grid(grid_points, x_max=1, y_max=1):
+    """Createes a grid of size (grid_points**2, 2) in the range of [-x_max, x_max] x [-y_max, y_max]"""
+    x_grid_space = jnp.linspace(-x_max, x_max, num=grid_points)
+    y_grid_space = jnp.linspace(-x_max, y_max, num=grid_points)
+    X, Y = jnp.meshgrid(x_grid_space, y_grid_space, indexing="ij")
     xy_grid = jnp.column_stack((X.flatten(), Y.flatten()))
-    xy_grid -= 0.5
-    xy_grid *= 2.0
     return xy_grid
-
 
 def create_dataset_sampler(initial_value_function, num_states):
     # num_states := in global state space including time before apply a transform_fn
