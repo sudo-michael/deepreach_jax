@@ -62,8 +62,8 @@ class DatasetState:
 def main(args):
     # normalization from world space to [-1, 1]^d
     alpha = {
-        "x": 5.0,
-        "y": 5.0,
+        "x": 4.0,
+        "y": 4.0,
         "theta": args.angle_alpha * np.pi,
     }
     beta = {
@@ -269,7 +269,7 @@ def main(args):
 
         # Get the meshgrid in the (x, y) coordinate
         grid_points = 200
-        mgrid_coords = xy_grid(200)
+        mgrid_coords = xy_grid(200, x_max=dataset_state.alpha['x'], y_max=dataset_state.alpha['y'])
 
         for time, row in zip(times, ax):
             for slice, col in zip(slices, row):
@@ -380,29 +380,29 @@ if __name__ in "__main__":
         p.add_argument("--t-min", type=float, default=0.0, required=False, 
                        help="Start time of the simulation",
         )
-        p.add_argument("--t-max", type=float, default=1.1, required=False, 
+        p.add_argument("--t-max", type=float, default=2.0, required=False, 
                        help="End time of the simulation"
         )
         # initial value function
-        p.add_argument("--collision-r", type=float, default=0.25, required=False, 
+        p.add_argument("--collision-r", type=float, default=0.2, required=False, 
                        help="Collision radius between vehicles",
         )
         # dynamics
-        p.add_argument("--num-states", type=int, default=10, required=False, 
+        p.add_argument("--num-states", type=int, default=10, required=False,  # 3 *(1e + 2p) + 1
                        help="Number of states in system including time",
         )
         p.add_argument("--angle-alpha", type=float, default=1.2, required=False, 
                        help="Angle alpha coefficient.",
         )
-        p.add_argument("--velocity-e", type=float, default=0.3, required=False, 
+        p.add_argument("--velocity-e", type=float, default=2.00, required=False, 
                        help="Velocity of Evader",
         )
-        p.add_argument("--velocity-p", type=float, default=0.6, required=False, 
+        p.add_argument("--velocity-p", type=float, default=0.14, required=False, 
                        help="Velocity of Persuer",
         )
-        p.add_argument("--omega-e", type=float, default=1.1, required=False, 
+        p.add_argument("--omega-e", type=float, default=2.84, required=False, 
                        help="Turn Rate of Evader") 
-        p.add_argument("--omega-p", type=float, default=1.1, required=False, 
+        p.add_argument("--omega-p", type=float, default=2.00, required=False, 
                        help="Turn Rate of Persuer") 
         # fmt: on
         args = p.parse_args()
