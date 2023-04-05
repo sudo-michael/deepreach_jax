@@ -15,26 +15,20 @@ import jax
 import jax.numpy as jnp
 from flax.training import train_state
 from flax import struct
-from flax.core.frozen_dict import FrozenDict
 
 
 import sys
-
 # TODO: make this into a package with setuptools
 sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 from modules import SirenNet
 from dataio import create_dataset_sampler, xy_grid
-from hj_functions import initialize_hji_loss, initialize_train_state
-from utils import unnormalize_value_function, normalize_value_function, cond_mkdir
+from hj_functions import initialize_hji_loss
+from utils import unnormalize_value_function, normalize_value_function 
 
 import wandb
 from train import train
-
-import orbax.checkpoint as orbax
-from flax.training import checkpoints
 
 
 @struct.dataclass
@@ -54,22 +48,98 @@ class DatasetState:
     # initial value function
     collision_r: float
     # normalize state space into range [-1, 1]
-    alpha: FrozenDict = FrozenDict({
-        "x": 4.0,
-        "y": 4.0,
-        "theta": 1.2 * np.pi,  # angle_alpha =: 1.2
-    })
-    beta: FrozenDict = FrozenDict({
-        "x": 0.0,
-        "y": 0.0,
-        "theta": 0.0,
-    })
+    alpha: dict
+    beta: dict
     # value function normaliziation
     norm_to: float = 0.02
     mean: float = 0.25
     var: float = 0.5
 
-def create_normalization_fn(dataset_state):
+
+def main(args):
+    # normalization from world space to [-1, 1]^d
+    alpha = {
+        "x": 5.0,
+        "y": 5.0,
+        "theta": args.angle_alpha * np.pi,
+    }
+    beta = {
+        "x": 0.0,
+        "y": 0.0,
+        "theta": 0.0,
+    }
+
+    key = jax.random.PRNGKey(args.seed)
+    key, model_key = jax.random.split(key)
+    layers = [args.num_nl for _ in range(args.num_hl)]
+
+    if args.periodic_transform:
+
+        @jax.vmap
+        def periodic_transform(normalized_tcoords):
+            # x should be in the range of [-1, 1]^d
+            # strech periodic dim to so that sin(x * alpha + beta) \in [-1, 1]
+            periodic_dim_scale = alpha["theta"] + beta["theta"]
+            return jnp.array(
+                [
+                    normalized_tcoords[0],  # t
+                    normalized_tcoords[1],  # x_e
+                    normalized_tcoords[2],  # y_e
+                    normalized_tcoords[3],  # x_p1
+                    normalized_tcoords[4],  # y_p1
+                    normalized_tcoords[5],  # x_p2
+                    normalized_tcoords[6],  # y_p2
+                    jnp.cos(normalized_tcoords[7] * periodic_dim_scale),  # cos(theta_e)
+                    jnp.sin(normalized_tcoords[7] * periodic_dim_scale),  # sin(theta_e)
+                    jnp.cos(
+                        normalized_tcoords[8] * periodic_dim_scale
+                    ),  # cos(theta_p1)
+                    jnp.sin(
+                        normalized_tcoords[8] * periodic_dim_scale
+                    ),  # sin(theta_p1)
+                    jnp.cos(
+                        normalized_tcoords[9] * periodic_dim_scale
+                    ),  # cos(theta_p2)
+                    jnp.sin(
+                        normalized_tcoords[9] * periodic_dim_scale
+                    ),  # sin(theta_p2)
+                ]
+            )
+
+        model = SirenNet(hidden_layers=layers, transform_fn=periodic_transform)
+        num_states = periodic_transform(jnp.ones((1, args.num_states))).shape[-1]
+    else:
+        model = SirenNet(hidden_layers=layers)
+        num_states = args.num_states
+
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=model.init(
+            model_key,
+            jnp.ones((1, num_states)),
+        ),
+        tx=optax.adam(learning_rate=args.lr),
+    )
+
+    dataset_state = DatasetState(
+        counter=0,
+        pretrain_end=args.pretrain_end,
+        counter_end=args.counter_end,
+        batch_size=args.batch_size,
+        samples_at_t_min=args.samples_at_t_min,
+        t_min=args.t_min,
+        t_max=args.t_max,
+        velocity_evader=args.velocity_e,
+        velocity_persuer=args.velocity_p,
+        omega_evader=args.omega_e,
+        omega_persuer=args.omega_p,
+        collision_r=args.collision_r,
+        alpha=alpha,
+        beta=beta,
+    )
+
+    ckpt = {"model": state, "config": vars(args), "dataset": dataset_state}
+
     alpha = jnp.array(
         [
             1,
@@ -108,17 +178,6 @@ def create_normalization_fn(dataset_state):
         # global frame to [-1, 1]^d
         return (unnormalized_tcoord - beta) / alpha
 
-    def scale_costates(dVdx):
-        return dVdx / alpha[1:]
-
-    return unnormalize_tcoords, normalize_tcoords, scale_costates
-
-
-def create_hj_fn(dataset_state):
-    unnormalize_tcoords, normalize_tcoords, scale_costates = create_normalization_fn(
-        dataset_state
-    )
-
     @jax.vmap
     def initial_value_function(normalized_tcoords):
         # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
@@ -133,13 +192,16 @@ def create_hj_fn(dataset_state):
         )
         return lx
 
+    def scale_costates(dVdx):
+        return dVdx / alpha[1:]
+
     @jax.vmap
     def compute_hamiltonian(nablaV, normalized_tcoords):
         tcoords = unnormalize_tcoords(normalized_tcoords)
         # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
         # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
 
-        dVdx = nablaV[1:]
+        dVdx = nablaV[1:]  # (x y theta)
 
         # TODO understand why we scale dVdx
         dVdx = scale_costates(dVdx)
@@ -172,104 +234,30 @@ def create_hj_fn(dataset_state):
         return ham
 
     @jax.vmap
-    def compute_opt_ctrl_dstb_fn(nablaV):
-        # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
-        # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
-        dVdx = nablaV[1:]
-        dVdtheta_e = dVdx[6]
-        dVdtheta_p1 = dVdx[7]
-        dVdtheta_p2 = dVdx[8]
+    def compute_opt_dstb(nablaV):
+        dVdx = nablaV[1:]  # (x y theta)
+        dVdtheta = dVdx[2]
 
-        # opt_ctrl to maximize V
-        opt_ctrl = dataset_state.omega_evader * (
-            dVdtheta_e > 0
-        ) + -dataset_state.omega_evader * (dVdtheta_e <= 0)
+        # computes control to maximize V
+        # > avoid obstacle
+        opt_ctrl = dataset_state.omega_max * (
+            dVdtheta > 0
+        ) + -dataset_state.omega_max * (dVdtheta <= 0)
+        return opt_ctrl
 
-        # opt_dstb to maximize V
-        opt_dstb_p1 = -dataset_state.omega_persuer * (
-            dVdtheta_p1 > 0
-        ) + dataset_state.omega_persuer * (dVdtheta_p1 <= 0)
-        opt_dstb_p2 = -dataset_state.omega_persuer * (
-            dVdtheta_p2 > 0
-        ) + dataset_state.omega_persuer * (dVdtheta_p2 <= 0)
+    @jax.vmap
+    def compute_opt_dstb(nablaV):
+        dVdx = nablaV[1:]  # (x y theta)
+        dVdtheta = dVdx[2]
 
-        return (opt_ctrl,), (opt_dstb_p1, opt_dstb_p2)
-
-    return initial_value_function, compute_hamiltonian, compute_opt_ctrl_dstb_fn
-
-def create_train_state(key, dataset_state, num_states, num_nl, num_hl, lr, use_periodic_transform):
-    if use_periodic_transform:
-
-        @jax.vmap
-        def periodic_transform(normalized_tcoords):
-            # x should be in the range of [-1, 1]^d
-            # strech periodic dim to so that sin(x * alpha + beta) \in [-1, 1]
-            periodic_dim_scale = dataset_state.alpha["theta"] + dataset_state.beta["theta"]
-            return jnp.array(
-                [
-                    normalized_tcoords[0],  # t
-                    normalized_tcoords[1],  # x_e
-                    normalized_tcoords[2],  # y_e
-                    normalized_tcoords[3],  # x_p1
-                    normalized_tcoords[4],  # y_p1
-                    normalized_tcoords[5],  # x_p2
-                    normalized_tcoords[6],  # y_p2
-                    jnp.cos(normalized_tcoords[7] * periodic_dim_scale),  # cos(theta_e)
-                    jnp.sin(normalized_tcoords[7] * periodic_dim_scale),  # sin(theta_e)
-                    jnp.cos(
-                        normalized_tcoords[8] * periodic_dim_scale
-                    ),  # cos(theta_p1)
-                    jnp.sin(
-                        normalized_tcoords[8] * periodic_dim_scale
-                    ),  # sin(theta_p1)
-                    jnp.cos(
-                        normalized_tcoords[9] * periodic_dim_scale
-                    ),  # cos(theta_p2)
-                    jnp.sin(
-                        normalized_tcoords[9] * periodic_dim_scale
-                    ),  # sin(theta_p2)
-                ]
-            )
-
-        state = initialize_train_state(
-            key, num_states, num_nl, num_hl, lr, periodic_transform
-        )
-    else:
-        state = initialize_train_state(key, num_states, num_nl, num_hl, lr)
-    return state
+        # computes control to maximize V
+        # > avoid obstacle
+        opt_ctrl = dataset_state.omega_max * (
+            dVdtheta > 0
+        ) + -dataset_state.omega_max * (dVdtheta <= 0)
+        return opt_ctrl
 
 
-def main(args):
-
-    key = jax.random.PRNGKey(args.seed)
-
-    dataset_state = DatasetState(
-        counter=0,
-        pretrain_end=args.pretrain_end,
-        counter_end=args.counter_end,
-        batch_size=args.batch_size,
-        samples_at_t_min=args.samples_at_t_min,
-        t_min=args.t_min,
-        t_max=args.t_max,
-        velocity_evader=args.velocity_e,
-        velocity_persuer=args.velocity_p,
-        omega_evader=args.omega_e,
-        omega_persuer=args.omega_p,
-        collision_r=args.collision_r,
-    )
-
-    key, model_key = jax.random.split(key)
-    state = create_train_state(model_key, dataset_state, args.num_states, args.num_nl, args.num_hl, args.lr, args.periodic_transform)
-
-
-
-    ckpt = {"model": state, "config": vars(args), "dataset": dataset_state}
-
-    (
-        initial_value_function,
-        compute_hamiltonian,
-        compute_opt_ctrl_dstb_fn,
-    ) = create_hj_fn(dataset_state)
 
     dubins_3d_dataset_sampler = create_dataset_sampler(
         initial_value_function, args.num_states
@@ -279,11 +267,6 @@ def main(args):
     loss_fn = initialize_hji_loss(state, args.min_with, compute_hamiltonian)
 
     def val_fn(state, epoch):
-        (
-            unnormalize_tcoords,
-            normalize_tcoords,
-            scale_costates,
-        ) = create_normalization_fn(dataset_state)
         times = [0.0, 0.5 * (args.t_max - 0.1), (args.t_max - 0.1)]
         x_p1s = [-1, -1, -1, -1]
         y_p1s = [0, 0, 0, 0]
@@ -309,14 +292,13 @@ def main(args):
 
         # Get the meshgrid in the (x, y) coordinate
         grid_points = 200
-        mgrid_coords = xy_grid(
-            200, x_max=dataset_state.alpha["x"], y_max=dataset_state.alpha["y"]
-        )
+        mgrid_coords = xy_grid(200, x_max=dataset_state.alpha['x'], y_max=dataset_state.alpha['y'])
 
         for time, row in zip(times, ax):
             for slice, col in zip(slices, row):
                 ones = np.ones((mgrid_coords.shape[0], 1))
                 time_coords = ones * time
+                theta_evader = ones * slice["theta_e"]
                 x_p1 = ones * slice["x_p1"]
                 y_p1 = ones * slice["y_p1"]
                 x_p2 = ones * slice["x_p2"]
@@ -359,12 +341,10 @@ def main(args):
                     origin="lower",
                     extent=(-1.0, 1.0, -1.0, 1.0),
                 )
-                col.set_title(
-                    f"t={time:0.2f}, te={slice['theta_e']:0.2f}, tp1={slice['theta_p1']:0.2f} tp2={slice['theta_p2']:0.2f}"
-                )
+                col.set_title(f"t={time:0.2f}, te={slice['theta_e']:0.2f}, tp1={slice['theta_p1']:0.2f} tp2={slice['theta_p2']:0.2f}")
                 # fig.colorbar(s)
 
-        fig.suptitle("x=0, y=0, xp1=-1, yp2=0, xp2=1, yp2=0")
+        fig.suptitle('x=0, y=0, xp1=-1, yp2=0, xp2=1, yp2=0')
         fig.colorbar(im, ax=ax.ravel().tolist())
         wandb.log({"brt": fig}, step=epoch)
         plt.close(fig)
@@ -389,76 +369,75 @@ def main(args):
         )
 
 
-def get_args():
-    p = argparse.ArgumentParser()
-    # fmt: off
-    p.add_argument("--experiment-name", type=str, required=True)
-    p.add_argument("--wandb", action='store_true')
-    p.add_argument("--logging-root", type=str, default='logs')
-    p.add_argument('--epochs', type=int, default=100_000)
-    p.add_argument('--epochs-till-checkpoint', type=int, default=2_000)
-    p.add_argument('--pretrain-end', type=int, default=2_000)
-    p.add_argument('--counter-end', type=int, default=110_000)
-    p.add_argument('--batch_size', type=int, default=65_000)
-    p.add_argument('--samples-at-t-min', type=int, default=10_000)
-    p.add_argument('--lr', type=float, default=2e-5)
-    p.add_argument('--seed', type=int, default=1)
-    p.add_argument("--validate", action='store_true')
-    # siren
-    p.add_argument("--num-hl", type=int, default=2, required=False, 
-                    help="The number of hidden layers"
-    )
-    p.add_argument("--num-nl", type=int, default=512, required=False, 
-                    help="Number of neurons per hidden layer.",
-    )
-    p.add_argument("--periodic-transform", action='store_true',
-                    help="convert theta to cos(theta) sin(theta)",
-    )
-    # brt
-    p.add_argument("--min-with", type=str, default="target", required=False, choices=["none", "zero", "target"], 
-                    help="BRS vs BRT computation",
-    )
-    p.add_argument("--t-min", type=float, default=0.0, required=False, 
-                    help="Start time of the simulation",
-    )
-    p.add_argument("--t-max", type=float, default=2.0, required=False, 
-                    help="End time of the simulation"
-    )
-    # initial value function
-    p.add_argument("--collision-r", type=float, default=0.2, required=False, 
-                    help="Collision radius between vehicles",
-    )
-    # dynamics
-    p.add_argument("--num-states", type=int, default=10, required=False,  # 3 *(1e + 2p) + 1
-                    help="Number of states in system including time",
-    )
-    p.add_argument("--velocity-e", type=float, default=0.22, required=False, 
-                    help="Velocity of Evader",
-    )
-    p.add_argument("--velocity-p", type=float, default=0.14, required=False, 
-                    help="Velocity of Persuer",
-    )
-    p.add_argument("--omega-e", type=float, default=2.84, required=False, 
-                    help="Turn Rate of Evader") 
-    p.add_argument("--omega-p", type=float, default=2.00, required=False, 
-                    help="Turn Rate of Persuer") 
-    # fmt: on
-    args = p.parse_args()
-
-    assert args.pretrain_end < args.epochs
-
-    return args
-
-
 if __name__ in "__main__":
+
+    def get_args():
+        p = argparse.ArgumentParser()
+        # fmt: off
+        p.add_argument("--experiment-name", type=str, required=True)
+        p.add_argument("--wandb", action='store_true')
+        p.add_argument("--logging-root", type=str, default='logs')
+        p.add_argument('--epochs', type=int, default=100_000)
+        p.add_argument('--epochs-till-checkpoint', type=int, default=2_000)
+        p.add_argument('--pretrain-end', type=int, default=2_000)
+        p.add_argument('--counter-end', type=int, default=110_000)
+        p.add_argument('--batch_size', type=int, default=65_000)
+        p.add_argument('--samples-at-t-min', type=int, default=10_000)
+        p.add_argument('--lr', type=float, default=2e-5)
+        p.add_argument('--seed', type=int, default=1)
+        p.add_argument("--validate", action='store_true')
+        # siren
+        p.add_argument("--num-hl", type=int, default=2, required=False, 
+                       help="The number of hidden layers"
+        )
+        p.add_argument("--num-nl", type=int, default=512, required=False, 
+                       help="Number of neurons per hidden layer.",
+        )
+        p.add_argument("--periodic-transform", action='store_true',
+                       help="convert theta to cos(theta) sin(theta)",
+        )
+        # brt
+        p.add_argument("--min-with", type=str, default="target", required=False, choices=["none", "zero", "target"], 
+                       help="BRS vs BRT computation",
+        )
+        p.add_argument("--t-min", type=float, default=0.0, required=False, 
+                       help="Start time of the simulation",
+        )
+        p.add_argument("--t-max", type=float, default=1.1, required=False, 
+                       help="End time of the simulation"
+        )
+        # initial value function
+        p.add_argument("--collision-r", type=float, default=0.25, required=False, 
+                       help="Collision radius between vehicles",
+        )
+        # dynamics
+        p.add_argument("--num-states", type=int, default=10, required=False, 
+                       help="Number of states in system including time",
+        )
+        p.add_argument("--angle-alpha", type=float, default=1.2, required=False, 
+                       help="Angle alpha coefficient.",
+        )
+        p.add_argument("--velocity-e", type=float, default=0.3, required=False, 
+                       help="Velocity of Evader",
+        )
+        p.add_argument("--velocity-p", type=float, default=0.6, required=False, 
+                       help="Velocity of Persuer",
+        )
+        p.add_argument("--omega-e", type=float, default=1.1, required=False, 
+                       help="Turn Rate of Evader") 
+        p.add_argument("--omega-p", type=float, default=1.1, required=False, 
+                       help="Turn Rate of Persuer") 
+        # fmt: on
+        args = p.parse_args()
+
+        assert args.pretrain_end < args.epochs
+
+        return args
+
     args = get_args()
 
     if args.wandb:
         wandb.init(
-            project="deepreach_jax",
-            entity="mlu",
-            config=vars(args),
-            save_code=True,
-            tags=["1E2P"],
+            project="deepreach_jax", entity="mlu", config=vars(args), save_code=True, tags=['2A1D']
         )
     main(args)

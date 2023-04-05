@@ -22,8 +22,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules import SirenNet
 from dataio import create_dataset_sampler, xy_grid
-from loss_functions import initialize_hji_loss, initialize_opt_ctrl_fn
-from utils import unormalize_value_function, normalize_value_function
+from hj_functions import initialize_hji_loss, initialize_opt_ctrl_fn
+from utils import unnormalize_value_function, normalize_value_function
 
 import wandb
 from train import train
@@ -248,7 +248,7 @@ def main(args):
 
         # Get the meshgrid in the (x, y) coordinate
         grid_points = 200
-        mgrid_coords = xy_grid(200)
+        mgrid_coords = xy_grid(200, x_max=dataset_state.alpha['x'], y_max=dataset_state.alpha['y'])
 
         for time, row in zip(times, ax):
             for slice, col in zip(slices, row):
@@ -264,7 +264,7 @@ def main(args):
                 V = np.array(V)
                 V = V.reshape((grid_points, grid_points))
 
-                V = unormalize_value_function(
+                V = unnormalize_value_function(
                     V, dataset_state.norm_to, dataset_state.mean, dataset_state.var
                 )
 

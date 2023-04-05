@@ -1,5 +1,9 @@
 import jax.numpy as jnp
 import jax
+from modules import SirenNet
+from flax.training import train_state
+import optax
+from inspect import isfunction
 
 
 def jacobian(apply_fn, params, x):
@@ -56,3 +60,24 @@ def initialize_opt_ctrl_fn(state, compute_opt_ctrl_fn):
         nablaV, _ = jacobian(state.apply_fn, params, normalized_tcoords)
         return compute_opt_ctrl_fn(nablaV)
     return opt_ctrl_fn
+
+def initialize_train_state(key, num_states, num_nl, num_hl, lr, periodic_transform=None):
+    layers = [num_nl for _ in range(num_hl)]
+    if isfunction(periodic_transform):
+        model = SirenNet(hidden_layers=layers, transform_fn=periodic_transform)
+        num_states = periodic_transform(jnp.ones((1, num_states))).shape[-1]
+    else:
+        model = SirenNet(hidden_layers=layers)
+        num_states = num_states
+
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=model.init(
+            key,
+            jnp.ones((1, num_states)),
+        ),
+        tx=optax.adam(learning_rate=lr),
+    )
+    return state
+
+    
