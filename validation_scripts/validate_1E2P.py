@@ -5,9 +5,7 @@ import sys
 import gym
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
-import optax
 from atu3.brt.brt_air_3d import car_brt, grid
 from atu3.brt.brt_static_obstacle_3d import goal_r
 from atu3.utils import normalize_angle
@@ -16,10 +14,12 @@ from flax.training import train_state
 import orbax.checkpoint as orbax
 from flax.training import checkpoints
 
+import matplotlib.pyplot as plt
 import pickle
 
 # TODO: make this into a package with setuptools so we don't have to do this
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 from dataio import create_dataset_sampler, xy_grid
 from experiment_scripts.hji_1E2P import (
@@ -28,6 +28,7 @@ from experiment_scripts.hji_1E2P import (
     create_normalization_fn,
     create_train_state,
 )
+
 from hj_functions import initialize_train_state, initialize_opt_ctrl_fn, jacobian
 from modules import SirenNet
 from utils import normalize_value_function, unnormalize_value_function
@@ -62,7 +63,7 @@ class Air3DNpEnv(gym.Env):
         self.world_height = 10
 
         # state
-        self.persuer_states = [np.array([-1.5, -1.5, np.pi / 4]) for _ in range(self.n)]
+        self.persuer_states = [np.array([-1.5, -1.5, np.pi / 4]),  np.array([-1.5, -1.5, np.pi / 4])]
         self.evader_state = np.array([1.0, 1.0, np.pi / 4])
         self.goal_location = np.array([1.5, 1.5])
         self.goal_r = goal_r
@@ -73,13 +74,18 @@ class Air3DNpEnv(gym.Env):
 
         path = os.path.abspath(__file__)
         dir_path = os.path.dirname(path)
-        self.brt = np.load(os.path.join(dir_path, f"assets/brts/air3d_brt_0.npy"))
-        self.backup_brt = np.load(
-            os.path.join(dir_path, f"assets/brts/backup_air3d_brt_0.npy")
-        )
-        self.grid = grid
+        if use_deepreach:
+            self.use_deepreach = use_deepreach
+            self.opt_ctrl_dstb_fn, self.value_fn, self.dataset_state = load_deepreach(
+                "logs/1e2p_atu3_2"
+            )
+        else:
 
-        self.use_deepreach = use_deepreach
+            # self.brt = np.load(os.path.join(dir_path, f"assets/brts/air3d_brt_0.npy"))
+            # self.backup_brt = np.load(
+            # os.path.join(dir_path, f"assets/brts/backup_air3d_brt_0.npy")
+            # )
+            self.grid = grid
 
     def step(self, action):
         info = {}
@@ -88,21 +94,33 @@ class Air3DNpEnv(gym.Env):
             action = self.opt_ctrl()
             info["used_hj"] = True
 
-        self.evader_state = (
-            self.car.dynamics_non_hcl(0, self.evader_state, action) * self.dt
-            + self.evader_state
-        )
-        self.evader_state[2] = normalize_angle(self.evader_state[2])
-        for i in range(self.n):
-            persuer_action = self.opt_dstb(self.persuer_states[i])
-            self.persuer_states[i] = (
-                self.car.dynamics_non_hcl(
-                    0, self.persuer_states[i], persuer_action, is_evader=False
+        # self.evader_state = (
+        #     self.car.dynamics_non_hcl(0, self.evader_state, action) * self.dt
+        #     + self.evader_state
+        # )
+        # self.evader_state[2] = normalize_angle(self.evader_state[2])
+        if self.use_deepreach:
+            persuer_actions = self.opt_dstb(self.persuer_states)
+            for i in range(self.n):
+                self.persuer_states[i] = (
+                    self.car.dynamics_non_hcl(
+                        0, self.persuer_states[i], persuer_actions[i], is_evader=False
+                    )
+                    * self.dt
+                    + self.persuer_states[i]
                 )
-                * self.dt
-                + self.persuer_states[i]
-            )
-            self.persuer_states[i][2] = normalize_angle(self.persuer_states[i][2])
+                self.persuer_states[i][2] = normalize_angle(self.persuer_states[i][2])
+        else:
+            for i in range(self.n):
+                persuer_action = self.opt_dstb(self.persuer_states[i])
+                self.persuer_states[i] = (
+                    self.car.dynamics_non_hcl(
+                        0, self.persuer_states[i], persuer_action, is_evader=False
+                    )
+                    * self.dt
+                    + self.persuer_states[i]
+                )
+                self.persuer_states[i][2] = normalize_angle(self.persuer_states[i][2])
 
         dist_to_goal = np.linalg.norm(self.evader_state[:2] - self.goal_location[:2])
         reward = -dist_to_goal
@@ -143,7 +161,8 @@ class Air3DNpEnv(gym.Env):
         # self.persuer_states[0] = np.array([1.0, 0.3, -np.pi])
         # doesn't
         # self.evader_state = np.array([0.0, 0.0, np.pi])
-        # self.persuer_states[0] = np.array([-1.0, -0.3, 0.0])
+        self.persuer_states[0] = np.array([-1.0, 0.0, 0.0])
+        self.persuer_states[1] = np.array([1.0, 0.0, -np.pi])
         goal_locations = [
             np.array([2.5, 2.5]),
             np.array([0, 3.0]),
@@ -155,13 +174,13 @@ class Air3DNpEnv(gym.Env):
         random_idx = np.random.randint(0, len(goal_locations))
         self.goal_location = goal_locations[random_idx]
 
-        for i in range(self.n):
-            self.persuer_states[i] = np.random.uniform(
-                low=-self.world_boundary, high=self.world_boundary
-            )
+        # for i in range(self.n):
+        #     self.persuer_states[i] = np.random.uniform(
+        #         low=-self.world_boundary, high=self.world_boundary
+        #     )
 
-            # insert the persuer between the goal and the evader
-            self.persuer_states[i][:2] = goal_locations[random_idx] // 2
+        #     # insert the persuer between the goal and the evader
+        #     self.persuer_states[i][:2] = goal_locations[random_idx] // 2
 
         info = {}
         info["cost"] = 0
@@ -187,29 +206,31 @@ class Air3DNpEnv(gym.Env):
         goal = plt.Circle(self.goal_location[:2], radius=self.goal_r, color="g")
         self.ax.add_patch(goal)
 
-        X, Y = np.meshgrid(
-            np.linspace(self.grid.min[0], self.grid.max[0], self.grid.pts_each_dim[0]),
-            np.linspace(self.grid.min[1], self.grid.max[1], self.grid.pts_each_dim[1]),
-            indexing="ij",
-        )
 
-        relative_state = self.relative_state(self.persuer_states[0])
-        index = self.grid.get_index(relative_state)
-        angle = self.evader_state[2] % (2 * np.pi)
-        Xr = X * np.cos(angle) - Y * np.sin(angle)
-        Yr = X * np.sin(angle) + Y * np.cos(angle)
+        # X, Y = np.meshgrid(
+        #     np.linspace(self.grid.min[0], self.grid.max[0], self.grid.pts_each_dim[0]),
+        #     np.linspace(self.grid.min[1], self.grid.max[1], self.grid.pts_each_dim[1]),
+        #     indexing="ij",
+        # )
+
+        # relative_state = self.relative_state(self.persuer_states[0])
+        # index = self.grid.get_index(relative_state)
+        # angle = self.evader_state[2] % (2 * np.pi)
+        # Xr = X * np.cos(angle) - Y * np.sin(angle)
+        # Yr = X * np.sin(angle) + Y * np.cos(angle)
 
         # DEBUG: visualize relative state
         # add_robot(relative_state, color="orange")
         # add_robot(np.zeros(3), color="yellow")
 
-        self.ax.contour(
-            Xr + self.evader_state[0],
-            Yr + self.evader_state[1],
-            # X, Y,
-            self.brt[:, :, index[2]],
-            levels=[0.1],
-        )
+        if self.use_hj and not self.use_deepreach:
+            self.ax.contour(
+                Xr + self.evader_state[0],
+                Yr + self.evader_state[1],
+                # X, Y,
+                self.brt[:, :, index[2]],
+                levels=[0.1],
+            )
         self.ax.set_xlim(-5, 5)
         self.ax.set_ylim(-5, 5)
         self.ax.set_aspect("equal")
@@ -232,13 +253,24 @@ class Air3DNpEnv(gym.Env):
         return
 
     def use_opt_ctrl(self, threshold=0.2):
-        relative_state = self.relative_state(self.persuer_states[0])
-        return self.grid.get_value(self.brt, relative_state) < threshold
+        if self.use_deepreach:
+            unnormalized_tcoords = self.deepreach_state(
+                self.evader_state, self.persuer_states
+            )
+            value = self.value_fn(jnp.array(unnormalized_tcoords))
+            return value.item() < threshold
+        else:
+            relative_state = self.relative_state(self.persuer_states[0])
+            return self.grid.get_value(self.brt, relative_state) < threshold
 
     def opt_ctrl(self):
-        # TODO not working if the evader is not facing the persuer
-        # assert -np.pi <= self.evader_state[2] <= np.pi
-        if self.n > 1:
+        if self.use_deepreach:
+            unnormalized_tcoords = self.deepreach_state(
+                self.evader_state, self.persuer_states
+            )
+            opt_ctrl, _ = self.opt_ctrl_dstb_fn(jnp.array(unnormalized_tcoords)) # (1, ), _
+            return np.array(opt_ctrl[0])
+        elif self.n > 1:
             raise NotImplementedError("Only support 1 persuer for now")
         relative_state = self.relative_state(self.persuer_states[0])
         index = self.grid.get_index(relative_state)
@@ -249,6 +281,12 @@ class Air3DNpEnv(gym.Env):
         return opt_ctrl
 
     def opt_dstb(self, persuer_state):
+        if self.use_deepreach:
+            unnormalized_tcoords = self.deepreach_state(
+                self.evader_state, self.persuer_states
+            )
+            _, opt_dstbs = self.opt_ctrl_dstb_fn(jnp.array(unnormalized_tcoords))
+            return np.array(opt_dstbs)
         if self.n > 1:
             raise NotImplementedError("Only support 1 persuer for now")
         relative_state = self.relative_state(persuer_state)
@@ -279,6 +317,15 @@ class Air3DNpEnv(gym.Env):
         rotated_relative_state[2] = normalize_angle(relative_state[2])
         # print(rotated_relative_state)
         return rotated_relative_state
+
+    def deepreach_state(self, evader_state, persuer_states):
+        state = jnp.expand_dims(
+            state_to_unnormalized_tcoords(
+                evader_state, persuer_states, t=self.dataset_state.t_max
+            ),
+            0,
+        )
+        return state
 
     def get_obs(self, evader_state, persuer_states, goal):
         # return [x y cos(theta) sin(theta) all evader and persuers states]
@@ -391,9 +438,11 @@ def load_deepreach(ckpt_dir):
         compute_hamiltonian,
         compute_opt_ctrl_dstb_fn,
     ) = create_hj_fn(dataset_state)
-    unnormalize_tcoords_fn, normalize_tcoords_fn, scale_costates = create_normalization_fn(
-        dataset_state
-    )
+    (
+        unnormalize_tcoords_fn,
+        normalize_tcoords_fn,
+        scale_costates,
+    ) = create_normalization_fn(dataset_state)
     # DEEPREACH
 
     def opt_ctrl_dstb_fn(unnormalized_tcoords: jnp.array):
@@ -414,78 +463,80 @@ def main():
         np.array([1.0, 0.0, -np.pi]),
         np.array([-1.0, 0.0, 0.0]),
     ]
-    # from gym.wrappers import TimeLimit
-    # env = Air3DNpEnv(n=2, use_hj=True)
-    # env = TimeLimit(env, max_episode_steps=500)
+    from gym.wrappers import TimeLimit
 
-    opt_ctrl_dstb_fn, value_fn, dataset_state = load_deepreach("logs/1e2p_atu3_2")
+    env = Air3DNpEnv(n=2, use_hj=True, use_deepreach=True)
+    env = TimeLimit(env, max_episode_steps=500)
 
+    obs = env.reset()
+    done = False
+    while not done:
+        action = env.action_space.sample()
+        next_obs, reward, done, info = env.step(action)
+        env.render()
 
-    # Get the meshgrid in the (x, y) coordinate
-    grid_points = 200
-    mgrid_coords = xy_grid(
-        200, x_max=dataset_state.alpha["x"], y_max=dataset_state.alpha["y"]
-    )
+    # opt_ctrl_dstb_fn, value_fn, dataset_state = load_deepreach("logs/1e2p_atu3_2")
 
-    ones = np.ones((mgrid_coords.shape[0], 1))
-    time_coords = ones * 2.0
-    x_p1 = ones * persuer_states[0][0]
-    y_p1 = ones * persuer_states[0][1]
-    x_p2 = ones * persuer_states[1][0]
-    y_p2 = ones * persuer_states[1][1]
-    theta_evader = ones * evader_state[2]
-    theta_p1 = ones * persuer_states[0][2]
-    theta_p2 = ones * persuer_states[1][2]
-    unnormalized_tcoords = np.concatenate(
-        (
-            time_coords,
-            mgrid_coords,
-            x_p1,
-            y_p1,
-            x_p2,
-            y_p2,
-            theta_evader,
-            theta_p1,
-            theta_p2,
-        ),
-        axis=1,
-    )
-
-    unnormalized_tcoords = jnp.array(unnormalized_tcoords)
-    V = value_fn(unnormalized_tcoords)
-
-    V = np.array(V)
-    V = V.reshape((grid_points, grid_points))
-
-    V = unnormalize_value_function(
-        V, dataset_state.norm_to, dataset_state.mean, dataset_state.var
-    )
-
-    # Plot the zero level sets
-    V = (V <= 0.001) * 1.0
-
-    # Plot the actual data
-    im = plt.imshow(
-        V.T,
-        cmap="bwr",
-        origin="lower",
-        extent=(-1.0, 1.0, -1.0, 1.0),
-    )
-    plt.savefig('test.png')
-
-    # state = jnp.expand_dims(
-    #     state_to_unnormalized_tcoords(evader_state, persuer_states, t=args.t_max), 0
+    # # Get the meshgrid in the (x, y) coordinate
+    # grid_points = 200
+    # mgrid_coords = xy_grid(
+    #     200, x_max=dataset_state.alpha["x"], y_max=dataset_state.alpha["y"]
     # )
-    # _, opt_dstb = opt_dstb_fn(normalize_tcoords(unnormalized_tcoords))
-    # opt_dstb_p1 = opt_dstb[0].item()
-    # opt_dstb_p2 = opt_dstb[1].item()
+
+    # ones = np.ones((mgrid_coords.shape[0], 1))
+    # time_coords = ones * 2.0
+    # x_p1 = ones * persuer_states[0][0]
+    # y_p1 = ones * persuer_states[0][1]
+    # x_p2 = ones * persuer_states[1][0]
+    # y_p2 = ones * persuer_states[1][1]
+    # theta_evader = ones * evader_state[2]
+    # theta_p1 = ones * persuer_states[0][2]
+    # theta_p2 = ones * persuer_states[1][2]
+    # unnormalized_tcoords = np.concatenate(
+    #     (
+    #         time_coords,
+    #         mgrid_coords,
+    #         x_p1,
+    #         y_p1,
+    #         x_p2,
+    #         y_p2,
+    #         theta_evader,
+    #         theta_p1,
+    #         theta_p2,
+    #     ),
+    #     axis=1,
+    # )
+
+    # unnormalized_tcoords = jnp.array(unnormalized_tcoords)
+    # V = value_fn(unnormalized_tcoords)
+
+    # V = np.array(V)
+    # V = V.reshape((grid_points, grid_points))
+
+    # V = unnormalize_value_function(
+    #     V, dataset_state.norm_to, dataset_state.mean, dataset_state.var
+    # )
+
+    # # Plot the zero level sets
+    # V = (V <= 0.001) * 1.0
+
+    # # Plot the actual data
+    # # im = plt.imshow(
+    # #     V.T,
+    # #     cmap="bwr",
+    # #     origin="lower",
+    # #     extent=(-1.0, 1.0, -1.0, 1.0),
+    # # )
+
+    # # state = jnp.expand_dims(
+    # #     state_to_unnormalized_tcoords(evader_state, persuer_states, t=args.t_max), 0
+    # # )
+    # # _, opt_dstb = opt_dstb_fn(normalize_tcoords(unnormalized_tcoords))
+    # # opt_dstb_p1 = opt_dstb[0].item()
+    # # opt_dstb_p2 = opt_dstb[1].item()
+
+    # # INTEGRATE DEEPEACH TO GYM
 
 
 if __name__ in "__main__":
-    # from experiment_scripts.hji_1E2P import get_args
-    # args = get_args()
-
-    # with open('args.pickle', 'wb') as f:
-    #     args = pickle.dump(args, f, protocol=pickle.HIGHEST_PROTOCOL)
-    # del args
     main()

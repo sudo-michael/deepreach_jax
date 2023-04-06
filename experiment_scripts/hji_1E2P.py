@@ -1,6 +1,3 @@
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
@@ -452,6 +449,8 @@ def get_args():
 
 if __name__ in "__main__":
     args = get_args()
+    import matplotlib
+    matplotlib.use("Agg")
 
     if args.wandb:
         wandb.init(
