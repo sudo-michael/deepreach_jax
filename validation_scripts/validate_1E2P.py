@@ -2,6 +2,8 @@ import itertools
 import os
 import sys
 
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
 import gym
 import jax
 import jax.numpy as jnp
@@ -79,6 +81,7 @@ class Air3DNpEnv(gym.Env):
             self.opt_ctrl_dstb_fn, self.value_fn, self.dataset_state = load_deepreach(
                 "logs/1e2p_atu3_2"
             )
+
         else:
 
             # self.brt = np.load(os.path.join(dir_path, f"assets/brts/air3d_brt_0.npy"))
@@ -154,13 +157,19 @@ class Air3DNpEnv(gym.Env):
         )
 
     def reset(self, seed=None):
-        self.evader_state = np.array([0.0, 0.0, 0.0])
         # DEBUG: the following cases show when the brt is not working
         # works
         # self.evader_state = np.array([0.0, 0.0, 0.0])
         # self.persuer_states[0] = np.array([1.0, 0.3, -np.pi])
         # doesn't
         # self.evader_state = np.array([0.0, 0.0, np.pi])
+        # works
+        self.evader_state = np.array([0.0, 0.0, -np.pi])
+        self.persuer_states[0] = np.array([-1.0, 0.0, 0.0])
+        self.persuer_states[1] = np.array([1.0, 0.0, -np.pi])
+        # ddoesn't
+        # self.evader_state = np.array([0.0, 0.0, 0.0])
+        self.evader_state = np.array([0.0, -1.0, np.pi/2])
         self.persuer_states[0] = np.array([-1.0, 0.0, 0.0])
         self.persuer_states[1] = np.array([1.0, 0.0, -np.pi])
         goal_locations = [
@@ -374,6 +383,8 @@ class Air3DNpEnv(gym.Env):
 #         env.render()
 #     env.close()
 def state_to_unnormalized_tcoords(evader_state, persuer_states, t=0.0):
+    # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
+    # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
     unnormalized_tcoords = jnp.array(
         [
             t,
@@ -445,6 +456,7 @@ def load_deepreach(ckpt_dir):
     ) = create_normalization_fn(dataset_state)
     # DEEPREACH
 
+    @jax.jit
     def opt_ctrl_dstb_fn(unnormalized_tcoords: jnp.array):
         normalize_tcoords = normalize_tcoords_fn(unnormalized_tcoords)
         nablaV, _ = jacobian(state.apply_fn, state.params, normalize_tcoords)
@@ -458,11 +470,6 @@ def load_deepreach(ckpt_dir):
 
 
 def main():
-    evader_state = np.array([0.0, 0.0, np.pi / 2])
-    persuer_states = [
-        np.array([1.0, 0.0, -np.pi]),
-        np.array([-1.0, 0.0, 0.0]),
-    ]
     from gym.wrappers import TimeLimit
 
     env = Air3DNpEnv(n=2, use_hj=True, use_deepreach=True)
@@ -472,8 +479,11 @@ def main():
     done = False
     while not done:
         action = env.action_space.sample()
+        # time function call
+        # start = time.process_time()
         next_obs, reward, done, info = env.step(action)
-        env.render()
+        # print(f"time : {time.process_time() - start=}")
+        # env.render()
 
     # opt_ctrl_dstb_fn, value_fn, dataset_state = load_deepreach("logs/1e2p_atu3_2")
 
@@ -535,8 +545,10 @@ def main():
     # # opt_dstb_p1 = opt_dstb[0].item()
     # # opt_dstb_p2 = opt_dstb[1].item()
 
-    # # INTEGRATE DEEPEACH TO GYM
 
+    # TODO  ensure that both persuers optimal controll good
+        # TODO try switching pos of p1 and p2
+        # TODO try using periodic function
 
 if __name__ in "__main__":
     main()
