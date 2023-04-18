@@ -4,6 +4,8 @@ from modules import SirenNet
 from flax.training import train_state
 import optax
 from inspect import isfunction
+from jax.tree_util import register_pytree_node
+
 
 
 def jacobian(apply_fn, params, x):
@@ -81,3 +83,30 @@ def initialize_train_state(key, num_states, num_nl, num_hl, lr, periodic_transfo
     return state
 
     
+
+class HJIData:
+    def __init__(self, dataset_state) -> None:
+        self.dataset_state = dataset_state
+
+    def normalize_tcords(self, unnormalized_tcoord):
+        pass
+    def unnormalize_tcords(self, normalized_tcoord):
+        pass
+    def scale_costates(self, dVdx):
+        pass
+
+    def _tree_flatten(self):
+        # children = (self.x, ) # arrays / dynamic values
+        # aux_data = {dict} # static values
+        # return (children, aux_data)
+        return None
+
+    @classmethod
+    def _tree_unflatten(cls, aux_data, children):
+        return cls(*children, **aux_data)
+
+register_pytree_node(
+    HJIData,
+    HJIData._tree_flatten,    # tell JAX what are the children nodes
+    HJIData._tree_unflatten   # tell JAX how to pack back into a RegisteredSpecial
+)
