@@ -2,6 +2,8 @@ import itertools
 import os
 import sys
 
+# it's a bit faster to run on CPU than on GPU
+# 0.017 vs 0.021 per step
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
 import gym
@@ -79,11 +81,10 @@ class Air3DNpEnv(gym.Env):
         if use_deepreach:
             self.use_deepreach = use_deepreach
             self.opt_ctrl_dstb_fn, self.value_fn, self.dataset_state = load_deepreach(
-                "logs/1e2p_atu3_2"
+                "logs/1e2p_atu3_4"
             )
 
         else:
-
             # self.brt = np.load(os.path.join(dir_path, f"assets/brts/air3d_brt_0.npy"))
             # self.backup_brt = np.load(
             # os.path.join(dir_path, f"assets/brts/backup_air3d_brt_0.npy")
@@ -278,7 +279,7 @@ class Air3DNpEnv(gym.Env):
                 self.evader_state, self.persuer_states
             )
             opt_ctrl, _ = self.opt_ctrl_dstb_fn(jnp.array(unnormalized_tcoords)) # (1, ), _
-            return np.array(opt_ctrl[0])
+            return np.array(opt_ctrl[0]) # (1, )
         elif self.n > 1:
             raise NotImplementedError("Only support 1 persuer for now")
         relative_state = self.relative_state(self.persuer_states[0])
@@ -471,7 +472,7 @@ def load_deepreach(ckpt_dir):
 
 def main():
     from gym.wrappers import TimeLimit
-
+    import time
     env = Air3DNpEnv(n=2, use_hj=True, use_deepreach=True)
     env = TimeLimit(env, max_episode_steps=500)
 
@@ -480,9 +481,9 @@ def main():
     while not done:
         action = env.action_space.sample()
         # time function call
-        # start = time.process_time()
+        start = time.process_time()
         next_obs, reward, done, info = env.step(action)
-        # print(f"time : {time.process_time() - start=}")
+        print(f"time : {time.process_time() - start=}")
         # env.render()
 
     # opt_ctrl_dstb_fn, value_fn, dataset_state = load_deepreach("logs/1e2p_atu3_2")

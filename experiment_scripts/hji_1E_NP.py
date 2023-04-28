@@ -42,10 +42,12 @@ class DatasetState:
     t_min: float
     t_max: float
     # dynamics
+    num_evaders: int
+    num_pursuers: int
     velocity_evader: float
-    velocity_persuer: float
+    velocity_pursuer: float
     omega_evader: float
-    omega_persuer: float
+    omega_pursuer: float
     # initial value function
     collision_r: float
     # normalize state space into range [-1, 1]
@@ -69,35 +71,23 @@ class DatasetState:
     var: float = 0.5
 
 
+# state sequence
+# [t x1 y1 x2 y2 ... xN yN, theta1, theta2, ..., thetaN]
 def create_normalization_fn(dataset_state):
     alpha = jnp.array(
-        [
-            1,
-            dataset_state.alpha["x"],
-            dataset_state.alpha["y"],
-            dataset_state.alpha["x"],
-            dataset_state.alpha["y"],
-            dataset_state.alpha["x"],
-            dataset_state.alpha["y"],
-            dataset_state.alpha["theta"],
-            dataset_state.alpha["theta"],
-            dataset_state.alpha["theta"],
-        ]
+        [1]
+        + [dataset_state.alpha["x"], dataset_state.alpha["y"]]
+        * (dataset_state.num_pursuers + dataset_state.num_evaders)
+        + [dataset_state.alpha["theta"]]
+        * (dataset_state.num_pursuers + dataset_state.num_evaders)
     )
 
     beta = jnp.array(
-        [
-            0,
-            dataset_state.beta["x"],
-            dataset_state.beta["y"],
-            dataset_state.beta["x"],
-            dataset_state.beta["y"],
-            dataset_state.beta["x"],
-            dataset_state.beta["y"],
-            dataset_state.beta["theta"],
-            dataset_state.beta["theta"],
-            dataset_state.beta["theta"],
-        ]
+        [0]
+        + [dataset_state.beta["x"], dataset_state.beta["y"]]
+        * (dataset_state.num_pursuers + dataset_state.num_evaders)
+        + [dataset_state.beta["theta"]]
+        * (dataset_state.num_pursuers + dataset_state.num_evaders)
     )
 
     def unnormalize_tcoords(normalized_tcoord):
@@ -121,13 +111,18 @@ def create_hj_fn(dataset_state):
 
     @jax.vmap
     def initial_value_function(normalized_tcoords):
-        # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
-        # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
-
+        # state sequence
+        # [t x1 y1 x2 y2 ... xN yN, theta1, theta2, ..., thetaN]
         tcoords = unnormalize_tcoords(normalized_tcoords)
-        lx1 = jnp.linalg.norm(tcoords[1:3] - tcoords[3:5]) - dataset_state.collision_r
-        lx2 = jnp.linalg.norm(tcoords[1:3] - tcoords[5:7]) - dataset_state.collision_r
-        lx = jnp.minimum(lx1, lx2)
+        lx = jnp.linalg.norm(tcoords[1:3] - tcoords[3:5]) - dataset_state.collision_r
+        for i in range(1, dataset_state.num_pursuers):
+            lx = jnp.minimum(
+                lx,
+                jnp.linalg.norm(
+                    tcoords[1:3] - tcoords[2 * (i + 1) + 1 : 2 * (i + 1) + 3]
+                )
+                - dataset_state.collision_r,
+            )
         lx = normalize_value_function(
             lx, dataset_state.norm_to, dataset_state.mean, dataset_state.var
         )
@@ -136,72 +131,76 @@ def create_hj_fn(dataset_state):
     @jax.vmap
     def compute_hamiltonian(nablaV, normalized_tcoords):
         tcoords = unnormalize_tcoords(normalized_tcoords)
-        # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
-        # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
+        # state sequence
+        # [t x1 y1 x2 y2 ... xN yN, theta1, theta2, ..., thetaN]
 
-        # TODO: remove this in the future
+        # NOTE: we are not using the time dimension
+        # TODO: remove in the future
         dVdx = nablaV[1:]
 
         # TODO understand why we scale dVdx
         dVdx = scale_costates(dVdx)
 
-        dVdx_e, dVdy_e, dVdtheta_e = dVdx[0], dVdx[1], dVdx[6]
-        dVdx_p1, dVdy_p1, dVdtheta_p1 = dVdx[2], dVdx[3], dVdx[7]
-        dVdx_p2, dVdy_p2, dVdtheta_p2 = dVdx[4], dVdx[5], dVdx[8]
-
-        x_e, y_e, theta_e = tcoords[1], tcoords[2], tcoords[7]
-        x_p1, y_p1, theta_p1 = tcoords[3], tcoords[4], tcoords[8]
-        x_p2, y_p2, theta_p2 = tcoords[5], tcoords[6], tcoords[9]
+        dVdx_e, dVdy_e, dVdtheta_e, theta_e = (
+            dVdx[0],
+            dVdx[1],
+            dVdx[2 * (dataset_state.num_pursuers + 1)],
+            tcoords[2 * (dataset_state.num_pursuers + 1) + 1],
+        )
 
         ham_evader = dataset_state.velocity_evader * dVdx_e * jnp.cos(
             theta_e
         ) + dataset_state.velocity_evader * dVdy_e * jnp.sin(theta_e)
         ham_evader = ham_evader + dataset_state.omega_evader * jnp.abs(dVdtheta_e)
 
-        ham_persuer1 = dataset_state.velocity_persuer * dVdx_p1 * jnp.cos(
-            theta_p1
-        ) + dataset_state.velocity_persuer * dVdy_p1 * jnp.sin(theta_p1)
-        ham_persuer1 = ham_persuer1 - dataset_state.omega_persuer * jnp.abs(dVdtheta_p1)
+        ham = ham_evader
 
-        ham_persuer2 = dataset_state.velocity_persuer * dVdx_p2 * jnp.cos(
-            theta_p2
-        ) + dataset_state.velocity_persuer * dVdy_p2 * jnp.sin(theta_p2)
-        ham_persuer2 = ham_persuer2 - dataset_state.omega_persuer * jnp.abs(dVdtheta_p2)
-
-        ham = ham_evader + ham_persuer1 + ham_persuer2
+        # TODO: figure if i need to chage this for jit
+        for j in range(dataset_state.num_pursuers):
+            dVdx_pj = dVdx[2 * (j + 1)]
+            dVdy_pj = dVdx[2 * (j + 1) + 1]
+            dVdtheta_pj = dVdx[2 * (dataset_state.num_pursuers + 1) + 1 + j]
+            # 1 := time
+            # 2 * (dataset_state.num_persuers + 1) := number of x-y pairs
+            # 1 := theta_e
+            # j := current persuer
+            theta_pj = tcoords[1 + 2 * (dataset_state.num_pursuers + 1) + 1 + j]
+            ham += (
+                dataset_state.velocity_pursuer * dVdx_pj * jnp.cos(theta_pj)
+                + dataset_state.velocity_pursuer * dVdy_pj * jnp.sin(theta_pj)
+                - dataset_state.omega_pursuer * jnp.abs(dVdtheta_pj)
+            )
 
         return ham
 
     @jax.vmap
     def compute_opt_ctrl_dstb_fn(nablaV):
-        # [state sequence: 0, 1,   2,   3     4,    5,    6,    7,       8,        9].
-        # [state sequence: t, x_e, y_e, x_p1, y_p1, x_p2, y_p2, theta_e, theta_p1, theta_p2].
         dVdx = nablaV[1:]
         dVdtheta_e = dVdx[6]
-        dVdtheta_p1 = dVdx[7]
-        dVdtheta_p2 = dVdx[8]
 
         # opt_ctrl to maximize V
         opt_ctrl = dataset_state.omega_evader * (
             dVdtheta_e > 0
         ) + -dataset_state.omega_evader * (dVdtheta_e <= 0)
 
+        opt_dstbs = []
         # opt_dstb to minimize V
-        opt_dstb_p1 = -dataset_state.omega_persuer * (
-            dVdtheta_p1 > 0
-        ) + dataset_state.omega_persuer * (dVdtheta_p1 <= 0)
-        opt_dstb_p2 = -dataset_state.omega_persuer * (
-            dVdtheta_p2 > 0
-        ) + dataset_state.omega_persuer * (dVdtheta_p2 <= 0)
+        for j in range(dataset_state.num_pursuers):
+            dVdtheta_pj = dVdx[2 * (dataset_state.num_pursuers + 1) + 1 + j]
+            opt_dstb_pj = -dataset_state.omega_pursuer * (
+                dVdtheta_pj > 0
+            ) + dataset_state.omega_pursuer * (dVdtheta_pj <= 0)
+            opt_dstbs.append(opt_dstb_pj)
 
-        return (opt_ctrl,), (opt_dstb_p1, opt_dstb_p2)
+        return (opt_ctrl,), tuple(opt_dstbs)
 
     return initial_value_function, compute_hamiltonian, compute_opt_ctrl_dstb_fn
 
 
 def create_train_state(
-    key, dataset_state, num_states, num_nl, num_hl, lr, use_periodic_transform
+    key, dataset_state, num_pursuers, num_nl, num_hl, lr, use_periodic_transform
 ):
+    num_states = 3 * (num_pursuers + 1) + 1
     if use_periodic_transform:
 
         @jax.vmap
@@ -218,8 +217,8 @@ def create_train_state(
                     normalized_tcoords[2],  # y_e
                     normalized_tcoords[3],  # x_p1
                     normalized_tcoords[4],  # y_p1
-                    normalized_tcoords[5],  # x_p2
-                    normalized_tcoords[6],  # y_p2
+                    # normalized_tcoords[5],  # x_p2
+                    # normalized_tcoords[6],  # y_p2
                     jnp.cos(normalized_tcoords[7] * periodic_dim_scale),  # cos(theta_e)
                     jnp.sin(normalized_tcoords[7] * periodic_dim_scale),  # sin(theta_e)
                     jnp.cos(
@@ -228,12 +227,12 @@ def create_train_state(
                     jnp.sin(
                         normalized_tcoords[8] * periodic_dim_scale
                     ),  # sin(theta_p1)
-                    jnp.cos(
-                        normalized_tcoords[9] * periodic_dim_scale
-                    ),  # cos(theta_p2)
-                    jnp.sin(
-                        normalized_tcoords[9] * periodic_dim_scale
-                    ),  # sin(theta_p2)
+                    # jnp.cose
+                    #     normalized_tcoords[9] * periodic_dim_scale
+                    # ),  # cos(theta_p2)
+                    # jnp.sin(
+                    #     normalized_tcoords[9] * periodic_dim_scale
+                    # ),  # sin(theta_p2)
                 ]
             )
 
@@ -253,6 +252,8 @@ def main(args):
 
     key = jax.random.PRNGKey(args.seed)
 
+    num_states = 3 * (args.num_pursuers + 1) + 1
+
     dataset_state = DatasetState(
         counter=0,
         pretrain_end=args.pretrain_end,
@@ -261,10 +262,12 @@ def main(args):
         samples_at_t_min=args.samples_at_t_min,
         t_min=args.t_min,
         t_max=args.t_max,
+        num_evaders=1,
+        num_pursuers=args.num_pursuers,
         velocity_evader=args.velocity_e,
-        velocity_persuer=args.velocity_p,
+        velocity_pursuer=args.velocity_p,
         omega_evader=args.omega_e,
-        omega_persuer=args.omega_p,
+        omega_pursuer=args.omega_p,
         collision_r=args.collision_r,
     )
 
@@ -272,7 +275,7 @@ def main(args):
     state = create_train_state(
         model_key,
         dataset_state,
-        args.num_states,
+        args.num_pursuers,
         args.num_nl,
         args.num_hl,
         args.lr,
@@ -288,7 +291,7 @@ def main(args):
     ) = create_hj_fn(dataset_state)
 
     dubins_3d_dataset_sampler = create_dataset_sampler(
-        initial_value_function, args.num_states
+        initial_value_function, num_states
     )
 
     # Define the loss
@@ -303,15 +306,16 @@ def main(args):
         times = [0.0, 0.5 * (args.t_max - 0.1), (args.t_max - 0.1)]
         x_p1s = [-1, -1, -1, -1]
         y_p1s = [0, 0, 0, 0]
-        x_p2s = [1, 1, 1, 1]
-        y_p2s = [0, 0, 0, 0]
+        # x_p2s = [1, 1, 1, 1]
+        # y_p2s = [0, 0, 0, 0]
         theta_es = [0, np.pi / 2, -np.pi, -np.pi / 2]
         theta_p1s = [0, 0, 0, 0]
-        theta_p2s = [-np.pi, -np.pi, -np.pi, -np.pi]
-        keys = ["x_p1", "y_p1", "x_p2", "y_p2", "theta_e", "theta_p1", "theta_p2"]
+        # theta_p2s = [-np.pi, -np.pi, -np.pi, -np.pi]
+        keys = ["x_p1", "y_p1", "theta_e", "theta_p1"]
         slices = [
             dict(zip(keys, items))
-            for items in zip(x_p1s, y_p1s, x_p2s, y_p2s, theta_es, theta_p1s, theta_p2s)
+            # for items in zip(x_p1s, y_p1s, x_p2s, y_p2s, theta_es, theta_p1s, theta_p2s)
+            for items in zip(x_p1s, y_p1s, theta_es, theta_p1s)
         ]
 
         fig, ax = plt.subplots(
@@ -445,14 +449,14 @@ def get_args():
                     help="Collision radius between vehicles",
     )
     # dynamics
-    p.add_argument("--num-states", type=int, default=10, required=False,  # 3 *(1e + 2p) + 1
-                    help="Number of states in system including time",
+    p.add_argument("--num-pursuers", type=int, default=1, required=False,  # 3 *(1e + 2p) + 1
+                    help="Number of pursuers",
     )
     p.add_argument("--velocity-e", type=float, default=0.22, required=False, 
                     help="Velocity of Evader",
     )
     p.add_argument("--velocity-p", type=float, default=0.22, required=False, 
-                    help="Velocity of Persuer",
+                    help="Velocity of Pursuer",
     )
     p.add_argument("--omega-e", type=float, default=2.84, required=False, 
                     help="Turn Rate of Evader") 

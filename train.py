@@ -5,7 +5,7 @@ import tqdm
 import orbax.checkpoint as orbax
 from flax.training import checkpoints
 import wandb
-
+import pickle
 
 def train(
     key,
@@ -21,6 +21,7 @@ def train(
     experiment_name,
 ):
     root_path = os.path.join(logging_root, experiment_name)
+
     checkpoints_dir = os.path.join(root_path, "checkpoints")
     cond_mkdir(checkpoints_dir)
 
