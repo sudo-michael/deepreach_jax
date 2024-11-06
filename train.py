@@ -2,8 +2,9 @@ import jax
 import os
 from utils import cond_mkdir
 import tqdm
-import orbax.checkpoint as orbax
-from flax.training import checkpoints
+import orbax.checkpoint
+import orbax
+from flax.training import checkpoints, orbax_utils
 import wandb
 import pickle
 
@@ -36,12 +37,30 @@ def train(
         state = state.apply_gradients(grads=grads)
         return state, loss, loss_info
 
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+
+    @jax.jit
+    def test(state, normalized_tcoords):
+        @jax.grad
+        def loss(params):
+            return state.apply_fn({"params": params}, jax.numpy.ones((50, 4))).mean()
+
+        grads = loss(state.params)
+        state = state.apply_gradients(grads=grads)
+        
+        return state
+
     for epoch in tqdm.tqdm(range(epochs)):
 
         key, dataset_key = jax.random.split(key)
         dataset_state, normalized_tcoords, gt = dataset_sampler_fn(
             dataset_key, dataset_state
         )
+
+        print(normalized_tcoords)
+        r = jax.random.uniform(key, normalized_tcoords.shape)
+        test(state, r)
+
 
         state, train_loss, loss_info = update(
             state,
@@ -54,16 +73,13 @@ def train(
         loss_infos.append(loss_info)
 
         if not epoch % epochs_till_checkpoint and epoch:
-            orbax_checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
             ckpt["dataset"] = dataset_state
             ckpt["model"] = state
-            checkpoints.save_checkpoint(
-                ckpt_dir=checkpoints_dir,
-                target=ckpt,
-                step=epoch,
-                overwrite=True,
-                keep=2,
-                orbax_checkpointer=orbax_checkpointer,
+            orbax_checkpointer.save(
+                checkpoints_dir,
+                ckpt,
+                save_args=orbax_utils.save_args_from_target(ckpt),
+                force=True
             )
             wandb.log(
                 {

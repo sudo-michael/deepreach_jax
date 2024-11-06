@@ -95,12 +95,10 @@ def main(args):
         model = SirenNet(hidden_layers=layers)
         num_states = args.num_states
 
+    model_params = model.init(model_key, jnp.ones((1, num_states)))['params']
     state = train_state.TrainState.create(
         apply_fn=model.apply,
-        params=model.init(
-            model_key,
-            jnp.ones((1, num_states)),
-        ),
+        params=model_params,
         tx=optax.adam(learning_rate=args.lr),
     )
 
@@ -224,6 +222,7 @@ def main(args):
 
     # Define the loss
     loss_fn = initialize_hji_loss(state, args.min_with, compute_hamiltonian)
+    # loss_fn = jax.jit(loss_fn)
 
     def val_fn(state, epoch):
         times = [0.0, 0.5 * (args.t_max - 0.1), (args.t_max - 0.1)]
@@ -258,7 +257,7 @@ def main(args):
                     (time_coords, mgrid_coords, theta_coords), axis=1
                 )
                 V = state.apply_fn(
-                    state.params, jnp.array(normalize_tcoords(unnormalized_tcoords))
+                    {'params': state.params}, jnp.array(normalize_tcoords(unnormalized_tcoords))
                 )
 
                 V = np.array(V)
@@ -352,7 +351,7 @@ if __name__ in "__main__":
         # fmt: off
         p.add_argument("--experiment-name", type=str, required=True)
         p.add_argument("--wandb", action='store_true')
-        p.add_argument("--logging-root", type=str, default='logs')
+        p.add_argument("--logging-root", type=str, default='/localhome/mla233/github/reduce_exploration/deepreach_jax/logs')
         p.add_argument('--epochs', type=int, default=100_000)
         p.add_argument('--epochs-till-checkpoint', type=int, default=2_000)
         p.add_argument('--pretrain-end', type=int, default=2_000)

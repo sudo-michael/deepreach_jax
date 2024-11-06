@@ -1,1 +1,1 @@
-python experiment_scripts/hji_1E2P.py --wandb --experiment-name 1e2p_atu3_4 --periodic-transform
+python experiment_scripts/hji_air3d.py --experiment-name air3d-test 
