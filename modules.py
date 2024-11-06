@@ -165,3 +165,5 @@ class SirenNet(nn.Module):
         x = SirenDense(self.output_dim, kernel_init=siren_init(w0=self.omega), bias_init=bias_uniform())(x)
         # fmt: on
         return x
+
+

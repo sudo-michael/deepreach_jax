@@ -11,8 +11,13 @@ def xy_grid(grid_points, x_max=1, y_max=1):
     return xy_grid
 
 def create_dataset_sampler(initial_value_function, num_states):
-    # num_states := in global state space including time before apply a transform_fn
-    # for example for dubins3d it would be 4  (t x y theta)
+    """A function that returns a dataset sampler for the given initial value function and number of states.
+
+    Args:
+        initial_value_function: vmap'd function that takes in tcoords and returns l(x) 
+        num_states: number of states in system, excluding time 
+        batch_size: number of samples to generate per call (necessary for jit)
+    """
 
     def dataset_sampler(key, dataset_state):
         coords_key, time_key = jax.random.split(key)
@@ -32,7 +37,7 @@ def create_dataset_sampler(initial_value_function, num_states):
                     minval=0,
                     maxval=(dataset_state.t_max - dataset_state.t_min)
                     * jnp.minimum(
-                        (dataset_state.counter / dataset_state.counter_end), 1.0
+                        (dataset_state.counter / dataset_state.time_curriculum_end), 1.0
                     ),  # lerp time up to t_max
                 )
                 # / t_max  # ensure all inputs are in [-1, 1]
