@@ -3,13 +3,12 @@ Implementation of [Deepreach](https://github.com/smlbansal/deepreach) in Jax / F
 
 ## Installation
 ```
-conda env create -f environment.yml
-conda activate deepreach
+uv sync
 ```
 
 ## Example
 ```
-python experiment_scripts/hji_air3d --wandb --experiment-name air3d-jax
+uv run hji_air3d.py --wandb --experiment-name air3d-jax
 ```
 
 ## Jax vs PyTorch

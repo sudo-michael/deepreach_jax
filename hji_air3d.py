@@ -1,6 +1,3 @@
-import matplotlib
-
-# matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
@@ -16,19 +13,14 @@ import jax.numpy as jnp
 from flax.training import train_state
 from flax import struct
 
-import sys
-
-# TODO: make this into a package with setuptools so we don't have to do this
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from modules import SirenNet
-from dataio import create_dataset_sampler, xy_grid
-from hj_functions import initialize_hji_loss, initialize_opt_ctrl_fn
-from utils import unnormalize_value_function, normalize_value_function
+from deepreach_jax.modules import SirenNet
+from deepreach_jax.dataio import create_dataset_sampler, xy_grid
+from deepreach_jax.hj_functions import initialize_hji_loss
+from deepreach_jax.utils import unnormalize_value_function, normalize_value_function
 
 import wandb
 from train import train
 
-import orbax.checkpoint as orbax
 from flax.training import checkpoints
 
 
@@ -37,6 +29,7 @@ class DatasetState:
     counter: int
     pretrain_end: int  # for only training ground truth value function at t=t_min
     counter_end: int  # when time can finally be sampled at t_max
+    time_curriculum_end: int
     batch_size: int
     samples_at_t_min: int
     t_min: float
@@ -95,7 +88,7 @@ def main(args):
         model = SirenNet(hidden_layers=layers)
         num_states = args.num_states
 
-    model_params = model.init(model_key, jnp.ones((1, num_states)))['params']
+    model_params = model.init(model_key, jnp.ones((1, num_states)))["params"]
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=model_params,
@@ -108,6 +101,7 @@ def main(args):
         counter_end=args.counter_end,
         batch_size=args.batch_size,
         samples_at_t_min=args.samples_at_t_min,
+        time_curriculum_end=args.time_curriculum_end,
         t_min=args.t_min,
         t_max=args.t_max,
         velocity=args.velocity,
@@ -247,7 +241,9 @@ def main(args):
 
         # Get the meshgrid in the (x, y) coordinate
         grid_points = 200
-        mgrid_coords = xy_grid(200, x_max=dataset_state.alpha['x'], y_max=dataset_state.alpha['y'])
+        mgrid_coords = xy_grid(
+            200, x_max=dataset_state.alpha["x"], y_max=dataset_state.alpha["y"]
+        )
 
         for time, row in zip(times, ax):
             for slice, col in zip(slices, row):
@@ -257,7 +253,8 @@ def main(args):
                     (time_coords, mgrid_coords, theta_coords), axis=1
                 )
                 V = state.apply_fn(
-                    {'params': state.params}, jnp.array(normalize_tcoords(unnormalized_tcoords))
+                    {"params": state.params},
+                    jnp.array(normalize_tcoords(unnormalized_tcoords)),
                 )
 
                 V = np.array(V)
@@ -291,43 +288,6 @@ def main(args):
         state = ckpt["model"]
         val_fn(state, 0)
 
-        # opt_ctrl_fn = initialize_opt_ctrl_fn(state, compute_opt_ctrl)
-        # tstate = jnp.array([1.0, 0.8, 0.8, -0.5 * jnp.pi]).reshape(1, -1)
-        # V = state.apply_fn(state.params, normalize_tcoords(tstate))
-        # opt_ctrl_fn(state.params, normalize_tcoords(tstate))
-
-        # def controller(t, tstate, eps=0.1):
-        #     V = unormalize_value_function(
-        #         state.apply_fn(state.params, normalize_tcoords(tstate)),
-        #         dataset_state.norm_to,
-        #         dataset_state.mean,
-        #         dataset_state.var,
-        #     ).item()
-        #     if V < eps:
-        #         return opt_ctrl_fn(state.params, normalize_tcoords(tstate)).item()
-        #     else:
-        #         if t % 2 == 0:
-        #             return dataset_state.omega_max
-        #         else:
-        #             return -dataset_state.omega_max
-
-        # def simulate(tstate, u, dt=0.05):
-        #     t = tstate[0][0]
-        #     theta = tstate[0][3]
-        #     x_dot = jnp.array([0, jnp.cos(theta), jnp.sin(theta), u])
-
-        #     return tstate + x_dot * 0.05
-        # X = []
-        # Y = []
-        # for t in range(100):
-        #     u = controller(t, tstate)
-        #     next_tstate = simulate(tstate, u)
-        #     tstate = next_tstate
-
-        #     X.append(tstate[0][1])
-        #     Y.append(tstate[0][2])
-        # plt.scatter(X, Y)
-        # plt.show()
     else:
         train(
             key,
@@ -351,11 +311,12 @@ if __name__ in "__main__":
         # fmt: off
         p.add_argument("--experiment-name", type=str, required=True)
         p.add_argument("--wandb", action='store_true')
-        p.add_argument("--logging-root", type=str, default='/localhome/mla233/github/reduce_exploration/deepreach_jax/logs')
+        p.add_argument("--logging-root", type=str, default='logs')
         p.add_argument('--epochs', type=int, default=100_000)
         p.add_argument('--epochs-till-checkpoint', type=int, default=2_000)
         p.add_argument('--pretrain-end', type=int, default=2_000)
         p.add_argument('--counter-end', type=int, default=110_000)
+        p.add_argument('--time_curriculum_end', type=int, default=100_000)
         p.add_argument('--batch_size', type=int, default=65_000)
         p.add_argument('--samples-at-t-min', type=int, default=10_000)
         p.add_argument('--lr', type=float, default=2e-5)
